@@ -1,0 +1,107 @@
+# =========================
+# Python / FastAPI
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Environment files (keep secrets out of git)
+.env
+.env.*
+!.env.example
+
+# =========================
+# Packaging / build
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.whl
+
+# =========================
+# Test / coverage
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+test-results/
+junit.xml
+
+# =========================
+# Type checkers / linters
+# =========================
+.mypy_cache/
+.pyright/
+.pytype/
+.ruff_cache/
+.cache/
+
+# =========================
+# Runtime / logs
+# =========================
+*.log
+logs/
+*.pid
+
+# =========================
+# Uvicorn / Gunicorn
+# =========================
+*.sock
+
+# =========================
+# Databases / local data
+# =========================
+*.sqlite3
+*.db
+data/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS junk
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDEs / editors
+# =========================
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# Docker / compose overrides
+# =========================
+docker-compose.override.yml
+
+# =========================
+# Dependency managers
+# =========================
+# Poetry
+.poetry/
+
+# PDM
+.pdm-python
+.pdm.toml
+
+# Pipenv
+# (Usually commit Pipfile + Pipfile.lock, ignore virtualenv folder if created)
