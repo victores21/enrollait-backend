@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel, HttpUrl
+import re
 
 from app.core.db import get_db
 from app.services.moodle import MoodleClient, MoodleError
@@ -269,3 +270,97 @@ async def moodle_user_exists(
         return {"ok": False, "message": f"Moodle error: {str(e)}"}
     except Exception as e:
         return {"ok": False, "message": f"Failed: {type(e).__name__}: {str(e)}"}
+
+_cat_slug_re = re.compile(r"[^a-z0-9-]+")
+
+def category_slugify(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = value.replace("_", "-").replace(" ", "-")
+    value = _cat_slug_re.sub("", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    return value or "category"
+
+def _ensure_categories_table(db: Session) -> None:
+    db.execute(text("""
+        create table if not exists categories (
+          id bigserial primary key,
+          tenant_id bigint not null references tenants(id) on delete cascade,
+          name text not null,
+          slug text not null,
+          moodle_category_id bigint,
+          created_at timestamptz not null default now(),
+          unique (tenant_id, slug)
+        );
+    """))
+    db.commit()
+
+    # Ensure column exists even if table already existed
+    db.execute(text("alter table categories add column if not exists moodle_category_id bigint;"))
+    db.commit()
+
+
+@router.post("/integrations/{tenant_id}/sync-categories")
+async def sync_categories(tenant_id: int, db: Session = Depends(get_db)):
+    _ensure_tenants_table(db)
+    _ensure_default_tenant(db)
+    _ensure_categories_table(db)
+
+    # 1) Load tenant Moodle config
+    row = db.execute(
+        text("select moodle_url, moodle_token from tenants where id = :id"),
+        {"id": tenant_id},
+    ).fetchone()
+
+    if not row or not row[0] or not row[1]:
+        return {"ok": False, "message": f"Tenant {tenant_id} not found or Moodle not configured"}
+
+    moodle_url, moodle_token = row[0], row[1]
+
+    # 2) Fetch categories from Moodle
+    try:
+        moodle = MoodleClient(moodle_url, moodle_token)
+        cats = await moodle.call("core_course_get_categories")
+    except MoodleError as e:
+        return {"ok": False, "message": f"Moodle error: {str(e)}"}
+    except Exception as e:
+        return {"ok": False, "message": f"Failed to fetch categories: {type(e).__name__}: {str(e)}"}
+
+    if not isinstance(cats, list):
+        return {"ok": False, "message": "Unexpected response from Moodle (categories not a list)"}
+
+    # 3) Prepare rows
+    rows = []
+    for c in cats:
+        moodle_category_id = c.get("id")
+        name = (c.get("name") or "").strip()
+        if not moodle_category_id or not name:
+            continue
+
+        rows.append({
+            "tenant_id": tenant_id,
+            "moodle_category_id": int(moodle_category_id),
+            "name": name,
+            "slug": category_slugify(name),
+        })
+    print("Rows", rows)
+    # 4) Upsert by moodle_category_id (true key)
+    upsert_sql = text("""
+        insert into categories (tenant_id, moodle_category_id, name, slug, created_at)
+        values (:tenant_id, :moodle_category_id, :name, :slug, now())
+        on conflict (tenant_id, moodle_category_id)
+        do update set
+          name = excluded.name,
+          slug = excluded.slug;
+    """)
+
+    if rows:
+        db.execute(upsert_sql, rows)
+        db.commit()
+
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "fetched_from_moodle": len(cats),
+        "upserted": len(rows),
+        "message": "Category sync complete ✅",
+    }
