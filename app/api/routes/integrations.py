@@ -156,6 +156,7 @@ async def sync_courses(tenant_id: int, db: Session = Depends(get_db)):
     try:
         moodle = MoodleClient(moodle_url, moodle_token)
         courses = await moodle.call("core_course_get_courses")
+        print("Courses", courses)
     except MoodleError as e:
         return {"ok": False, "message": f"Moodle error: {str(e)}"}
     except Exception as e:
