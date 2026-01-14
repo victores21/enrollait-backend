@@ -11,7 +11,7 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(integrations.router, tags=["Integrations"])
 app.include_router(moodle_users.router, tags=["Moodle Users", 'Moodle'])
 app.include_router(enrollments.router, tags=["Enrollments", 'Moodle'])
-app.include_router(products.router, tags=["Products", 'Moodle'])
-app.include_router(product_courses.router, tags=["Product Courses", 'Moodle'])
+app.include_router(products.router, tags=["Products"])
+app.include_router(product_courses.router, tags=["Product Courses"])
 
 
