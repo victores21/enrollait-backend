@@ -8,6 +8,8 @@ This is the backend API for the MVP:
 
 ---
 
+pip freeze > requirements.txt
+
 ## 1) Requirements
 
 - Python 3.11+
@@ -15,6 +17,7 @@ This is the backend API for the MVP:
 - Supabase project (Postgres) + `DATABASE_URL`
 - Stripe account (test keys for dev)
 - Moodle instance with Web Services enabled + token
+- Install requirements pip install -r requirements.txt
 
 ---
 
