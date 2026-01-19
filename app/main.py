@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends
 import os
 from fastapi.middleware.cors import CORSMiddleware
 
+
 from app.api.routes import health
 from app.api.routes import integrations
 from app.api.routes import moodle_users
@@ -12,6 +13,7 @@ from app.api.routes import stripe_config
 from app.api.routes import stripe_webhooks
 from app.api.routes import tenant
 from app.api.routes import stripe_checkout
+
 
 
 app = FastAPI(title="Enrollait API")
