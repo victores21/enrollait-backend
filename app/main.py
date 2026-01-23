@@ -5,15 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import health
 from app.api.routes import integrations
-from app.api.routes import moodle_users
-from app.api.routes import enrollments
 from app.api.routes import products
-from app.api.routes import product_courses
 from app.api.routes import stripe_config
 from app.api.routes import stripe_webhooks
-from app.api.routes import tenant
 from app.api.routes import stripe_checkout
-
+from app.api.routes import categories
+from app.api.routes import courses
+from app.api.routes import orders
 
 
 app = FastAPI(title="Enrollait API")
@@ -32,13 +30,11 @@ app.add_middleware(
 
 app.include_router(health.router, tags=["Health"])
 app.include_router(integrations.router, tags=["Integrations"])
-app.include_router(moodle_users.router, tags=["Moodle Users", 'Moodle'])
-app.include_router(enrollments.router, tags=["Enrollments", 'Moodle'])
 app.include_router(products.router, tags=["Products"])
-app.include_router(product_courses.router, tags=["Product Courses"])
 app.include_router(stripe_config.router, tags=["Stripe Config"])
 app.include_router(stripe_webhooks.router, tags=["Stripe Webhooks"])
-app.include_router(tenant.router, tags=["Tenant"])
 app.include_router(stripe_checkout.router, tags=["Stripe Checkout"])
-
+app.include_router(categories.router, tags=["Categories"])
+app.include_router(courses.router, tags=["Courses"])
+app.include_router(orders.router, tags=["Orders"])
 
