@@ -145,3 +145,33 @@ def save_stripe_config(
         )
 
     return {"ok": True, "tenant_id": int(tenant_id)}
+
+
+@router.get("/stripe/snapshot")
+def stripe_snapshot(
+    tenant_id: int = Depends(get_tenant_id_from_request),
+    db: Session = Depends(get_db),
+):
+    row = db.execute(
+        text("""
+            select stripe_secret_key, stripe_webhook_secret, stripe_publishable_key
+              from tenants
+             where id = :id
+             limit 1
+        """),
+        {"id": int(tenant_id)},
+    ).fetchone()
+
+    if not row:
+        return {"ok": False, "message": "Tenant not found"}
+
+    sk, whsec, pk = row[0], row[1], row[2]
+    configured = bool((sk or "").strip()) and bool((whsec or "").strip())
+
+    return {
+        "ok": True,
+        "tenant_id": int(tenant_id),
+        "configured": configured,
+        "stripe_publishable_key": pk,  # optional to show / prefill
+        # Don't send secrets back to the frontend.
+    }
