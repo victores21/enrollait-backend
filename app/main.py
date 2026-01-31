@@ -14,6 +14,7 @@ from app.api.routes import courses
 from app.api.routes import orders
 from app.api.routes import admin_auth
 from app.api.routes import admin_users
+from app.api.routes import onboarding
 
 
 app = FastAPI(title="Enrollait API")
@@ -42,4 +43,5 @@ app.include_router(courses.router, tags=["Courses"])
 app.include_router(orders.router, tags=["Orders"])
 app.include_router(admin_auth.router, tags=["Admin Auth"])
 app.include_router(admin_users.router, tags=["Admin Users"])
+app.include_router(onboarding.router, tags=["Onboarding"])
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from collections import defaultdict
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy import text
@@ -52,6 +52,10 @@ class MoodleTestByDomainPayload(BaseModel):
 class CreateTenantWithMoodlePayload(BaseModel):
     domain: str
     name: str | None = None
+    moodle_url: HttpUrl
+    token: str
+
+class SaveMoodleConfigPayload(BaseModel):
     moodle_url: HttpUrl
     token: str
 
@@ -110,222 +114,76 @@ def _get_tenant_moodle(db: Session, tenant_id: int) -> tuple[str, str] | None:
 # -----------------------------
 # Endpoints
 # -----------------------------
-# @router.post("/integrations/moodle/connect")
-# async def connect_moodle(payload: CreateTenantWithMoodlePayload, db: Session = Depends(get_db)):
-#     """
-#     Create tenant + save Moodle URL/token.
-#     - If domain exists => 409
-#     - Else create tenant row, save moodle_url/token, then test connection
-#     """
-#     domain_host = _normalize_domain_host(payload.domain)
-#     if not domain_host:
-#         raise HTTPException(status_code=400, detail="domain is required")
 
-#     moodle_url = str(payload.moodle_url).rstrip("/")
-#     token = (payload.token or "").strip()
-#     name = (payload.name or domain_host).strip()
-
-#     if not token:
-#         raise HTTPException(status_code=400, detail="token is required")
-
-#     # Create tenant row (rely on unique index tenants_domain_lower_uniq)
-#     try:
-#         with db.begin():
-#             row = db.execute(
-#                 text("""
-#                     insert into tenants (name, domain, moodle_url, moodle_token, created_at)
-#                     values (:name, :domain, :moodle_url, :token, now())
-#                     returning id
-#                 """),
-#                 {
-#                     "name": name,
-#                     "domain": domain_host,
-#                     "moodle_url": moodle_url,
-#                     "token": token,
-#                 },
-#             ).fetchone()
-#             tenant_id = int(row[0])
-#     except IntegrityError:
-#         # Domain already exists (unique lower(domain))
-#         existing = db.execute(
-#             text("select id from tenants where lower(domain) = lower(:d) limit 1"),
-#             {"d": domain_host},
-#         ).fetchone()
-#         raise HTTPException(
-#             status_code=status.HTTP_409_CONFLICT,
-#             detail={
-#                 "connected": False,
-#                 "message": "Domain already exists",
-#                 "domain": domain_host,
-#                 "tenant_id": int(existing[0]) if existing else None,
-#             },
-#         )
-#     except Exception as e:
-#         raise HTTPException(
-#             status_code=500,
-#             detail={"connected": False, "message": f"DB error creating tenant: {type(e).__name__}: {str(e)}"},
-#         )
-
-#     # Test connection (network call)
-#     try:
-#         client = MoodleClient(moodle_url, token)
-#         info = await client.test_connection()
-#         return {
-#             "connected": True,
-#             "message": "Tenant created + Connected ✅",
-#             "tenant_id": tenant_id,
-#             "domain": domain_host,
-#             "site_name": info.get("sitename"),
-#             "moodle_username": info.get("username"),
-#             "moodle_release": info.get("release"),
-#             "moodle_version": info.get("version"),
-#         }
-#     except MoodleError as e:
-#         # Tenant exists and config saved, but Moodle test failed
-#         return {"connected": False, "message": f"Connection failed: {str(e)}", "tenant_id": tenant_id, "domain": domain_host}
-#     except Exception as e:
-#         return {"connected": False, "message": f"Connection failed: {type(e).__name__}: {str(e)}", "tenant_id": tenant_id, "domain": domain_host}
 @router.post("/integrations/moodle/connect")
-async def connect_moodle(payload: CreateTenantWithMoodlePayload, db: Session = Depends(get_db)):
-    """
-    Create tenant + save Moodle URL/token AND register the host in tenant_domains.
-
-    Behavior:
-    - If host already exists in tenant_domains => 409 (domain already used by another app)
-    - Else create tenant row, then create tenant_domains row pointing to this tenant
-    - Then test Moodle connection (network call)
-      - If Moodle test fails, tenant still exists (config saved) and we return connected=False
-        (so user can fix token/url and retry with an "update" endpoint later if you add one)
-    """
-
-    domain_host = _normalize_domain_host(payload.domain)
-    if not domain_host:
-        raise HTTPException(status_code=400, detail="domain is required")
-
+async def connect_moodle(
+    payload: SaveMoodleConfigPayload = Body(...),
+    tenant_id: int = Depends(get_tenant_id_from_request),
+    db: Session = Depends(get_db),
+):
     moodle_url = str(payload.moodle_url).rstrip("/")
     token = (payload.token or "").strip()
-    name = (payload.name or domain_host).strip()
 
+    if not moodle_url:
+        raise HTTPException(status_code=400, detail="moodle_url is required")
     if not token:
         raise HTTPException(status_code=400, detail="token is required")
 
-    # 0) Block if this host already belongs to any tenant (enforces: 1 domain => 1 app)
-    existing = db.execute(
-        text("""
-            select td.tenant_id
-              from tenant_domains td
-             where lower(td.host) = :h
-             limit 1
-        """),
-        {"h": domain_host},
-    ).fetchone()
-
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "connected": False,
-                "message": "Domain already exists",
-                "domain": domain_host,
-                "tenant_id": int(existing[0]),
-            },
-        )
-
-    # 1) Create tenant + register primary host in tenant_domains (single transaction)
+    # 1) Save config (NO db.begin())
     try:
-        with db.begin():
-            row = db.execute(
-                text("""
-                    insert into tenants (name, domain, moodle_url, moodle_token, created_at)
-                    values (:name, :domain, :moodle_url, :token, now())
-                    returning id
-                """),
-                {
-                    "name": name,
-                    # keep tenants.domain for backwards compatibility / admin visibility
-                    "domain": domain_host,
-                    "moodle_url": moodle_url,
-                    "token": token,
-                },
-            ).fetchone()
-
-            if not row:
-                raise HTTPException(status_code=500, detail="Failed to create tenant")
-
-            tenant_id = int(row[0])
-
-            db.execute(
-                text("""
-                    insert into tenant_domains (tenant_id, host, created_at)
-                    values (:tid, :host, now())
-                """),
-                {"tid": tenant_id, "host": domain_host},
-            )
-
-    except IntegrityError as e:
-        # Could be unique(host) race, or unique(lower(domain)) if you still have it
-        msg = str(getattr(e, "orig", e))
-        # Try to find tenant_id for this host to return consistent 409
-        existing2 = db.execute(
+        row = db.execute(
             text("""
-                select td.tenant_id
-                  from tenant_domains td
-                 where lower(td.host) = :h
-                 limit 1
+                update tenants
+                   set moodle_url = :moodle_url,
+                       moodle_token = :token
+                 where id = :tid
+             returning id
             """),
-            {"h": domain_host},
+            {"moodle_url": moodle_url, "token": token, "tid": int(tenant_id)},
         ).fetchone()
 
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "connected": False,
-                "message": "Domain already exists",
-                "domain": domain_host,
-                "tenant_id": int(existing2[0]) if existing2 else None,
-                "error": msg,
-            },
-        )
+        if not row:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        db.commit()
 
     except HTTPException:
         raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail={
                 "connected": False,
-                "message": f"DB error creating tenant: {type(e).__name__}: {str(e)}",
+                "message": f"DB error saving Moodle config: {type(e).__name__}: {str(e)}",
             },
         )
 
-    # 2) Test Moodle connection (network call)
+    # 2) Test connection (network call)
     try:
         client = MoodleClient(moodle_url, token)
         info = await client.test_connection()
         return {
             "connected": True,
-            "message": "Tenant created + Connected ✅",
-            "tenant_id": tenant_id,
-            "domain": domain_host,
+            "message": "Saved + Connected ✅",
+            "tenant_id": int(tenant_id),
             "site_name": info.get("sitename"),
             "moodle_username": info.get("username"),
             "moodle_release": info.get("release"),
             "moodle_version": info.get("version"),
         }
     except MoodleError as e:
-        # Tenant exists and config saved, but Moodle test failed
         return {
             "connected": False,
             "message": f"Connection failed: {str(e)}",
-            "tenant_id": tenant_id,
-            "domain": domain_host,
+            "tenant_id": int(tenant_id),
         }
     except Exception as e:
         return {
             "connected": False,
             "message": f"Connection failed: {type(e).__name__}: {str(e)}",
-            "tenant_id": tenant_id,
-            "domain": domain_host,
+            "tenant_id": int(tenant_id),
         }
 
 @router.post("/integrations/moodle/test")
@@ -422,7 +280,7 @@ async def sync_courses(
         "tenant_id": int(tenant_id),
         "fetched_from_moodle": len(courses),
         "upserted": len(rows),
-        "message": "Sync complete ✅",
+        "message": "Sync complete",
     }
 
 
@@ -493,7 +351,7 @@ async def sync_categories(
         "tenant_id": int(tenant_id),
         "fetched_from_moodle": len(cats),
         "upserted": len(rows),
-        "message": "Category sync complete ✅",
+        "message": "Category sync complete",
     }
 
 @router.get("/integrations/moodle/snapshot")
