@@ -27,17 +27,16 @@ STEPS_ORDER: list[dict[str, Any]] = [
     {"key": "connect-moodle", "label": "Connect Moodle", "order": 1},
     {"key": "sync-moodle", "label": "Sync Moodle", "order": 2},
     {"key": "connect-stripe", "label": "Connect Stripe", "order": 3},
-    {"key": "test-purchase", "label": "Test Purchase", "order": 4},
+    {"key": "test-purchase", "label": "Create product", "order": 4},
 ]
-
 
 # -----------------------------
 # DB helpers
 # -----------------------------
 def _ensure_onboarding_table(db: Session) -> None:
     """
-    Creates the table if missing.
-    You can migrate this properly later, but this makes it work immediately.
+    Creates the table if missing and ensures required columns exist.
+    This is a "runtime migration" approach.
     """
     db.execute(
         text(
@@ -50,6 +49,17 @@ def _ensure_onboarding_table(db: Session) -> None:
             """
         )
     )
+
+    # Ensure the new column exists for older deployments
+    db.execute(
+        text(
+            """
+            alter table tenant_onboarding
+            add column if not exists admin_welcome_seen boolean not null default false;
+            """
+        )
+    )
+
     db.commit()
 
 
@@ -58,25 +68,22 @@ def _now_iso() -> str:
 
 
 def _normalize_steps(existing_steps: dict[str, Any] | None) -> dict[str, Any]:
-    """
-    Ensure all known steps exist in the steps json with structure.
-    """
     base: dict[str, Any] = {}
     for s in STEPS_ORDER:
         k = s["key"]
-        base[k] = {
-            "done": False,
-            "meta": {},
-            "completed_at": None,
-        }
+        base[k] = {"done": False, "meta": {}, "completed_at": None}
 
     if isinstance(existing_steps, dict):
-        # merge existing values
         for k, v in existing_steps.items():
             if k in base and isinstance(v, dict):
                 base[k]["done"] = bool(v.get("done", base[k]["done"]))
-                base[k]["meta"] = v.get("meta", base[k]["meta"]) if isinstance(v.get("meta", {}), dict) else base[k]["meta"]
+                base[k]["meta"] = (
+                    v.get("meta", base[k]["meta"])
+                    if isinstance(v.get("meta", {}), dict)
+                    else base[k]["meta"]
+                )
                 base[k]["completed_at"] = v.get("completed_at", base[k]["completed_at"])
+
     return base
 
 
@@ -93,12 +100,10 @@ def _compute_state(steps_obj: dict[str, Any]) -> dict[str, Any]:
             current = s
 
     if current is None:
-        # all done -> current is last step
         current = STEPS_ORDER[-1]
 
     percent = int(round((done_count / total) * 100)) if total else 0
 
-    # return as array (nice for frontend)
     steps_list = []
     for s in STEPS_ORDER:
         k = s["key"]
@@ -120,6 +125,46 @@ def _compute_state(steps_obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _get_or_create_onboarding_row(db: Session, tenant_id: int) -> tuple[dict[str, Any], bool]:
+    """
+    Returns (steps_obj, admin_welcome_seen).
+    If row doesn't exist, creates it with normalized steps and admin_welcome_seen=false.
+    """
+    row = db.execute(
+        text(
+            """
+            select steps, admin_welcome_seen
+              from tenant_onboarding
+             where tenant_id = :t
+             limit 1
+            """
+        ),
+        {"t": int(tenant_id)},
+    ).fetchone()
+
+    if row:
+        existing_steps = row[0] if row[0] else {}
+        admin_welcome_seen = bool(row[1])
+        return _normalize_steps(existing_steps), admin_welcome_seen
+
+    # Create row if missing (important so modal isn't "first time" forever)
+    steps_obj = _normalize_steps({})
+    steps_json = json.dumps(steps_obj)
+    db.execute(
+        text(
+            """
+            insert into tenant_onboarding (tenant_id, steps, admin_welcome_seen, updated_at)
+            values (:t, CAST(:steps AS jsonb), false, now())
+            on conflict (tenant_id)
+            do nothing
+            """
+        ),
+        {"t": int(tenant_id), "steps": steps_json},
+    )
+    db.commit()
+    return steps_obj, False
+
+
 # -----------------------------
 # API models
 # -----------------------------
@@ -135,6 +180,19 @@ class OnboardingStateResponse(BaseModel):
     steps: list[dict[str, Any]]
     current_step: dict[str, Any]
     progress: dict[str, Any]
+    admin_welcome_seen: bool
+    show_admin_welcome_modal: bool
+
+
+class AdminWelcomeSeenPayload(BaseModel):
+    seen: bool = True
+
+
+class AdminWelcomeSeenResponse(BaseModel):
+    ok: bool
+    tenant_id: int
+    admin_welcome_seen: bool
+    show_admin_welcome_modal: bool
 
 
 # -----------------------------
@@ -147,26 +205,17 @@ def get_onboarding_state(
 ):
     _ensure_onboarding_table(db)
 
-    row = db.execute(
-        text(
-            """
-            select steps
-              from tenant_onboarding
-             where tenant_id = :t
-             limit 1
-            """
-        ),
-        {"t": int(tenant_id)},
-    ).fetchone()
-
-    existing_steps = row[0] if row and row[0] else {}
-    steps_obj = _normalize_steps(existing_steps)
-
+    steps_obj, admin_welcome_seen = _get_or_create_onboarding_row(db, int(tenant_id))
     state = _compute_state(steps_obj)
+
+    show_modal = not admin_welcome_seen
+
     return {
         "ok": True,
         "tenant_id": int(tenant_id),
         **state,
+        "admin_welcome_seen": admin_welcome_seen,
+        "show_admin_welcome_modal": show_modal,
     }
 
 
@@ -178,28 +227,12 @@ def set_onboarding_step(
 ):
     _ensure_onboarding_table(db)
 
-    # 1) fetch existing
-    row = db.execute(
-        text(
-            """
-            select steps
-              from tenant_onboarding
-             where tenant_id = :t
-             limit 1
-            """
-        ),
-        {"t": int(tenant_id)},
-    ).fetchone()
+    steps_obj, admin_welcome_seen = _get_or_create_onboarding_row(db, int(tenant_id))
 
-    existing_steps = row[0] if row and row[0] else {}
-    steps_obj = _normalize_steps(existing_steps)
-
-    # 2) update one step
     step_key = payload.step
     steps_obj[step_key]["done"] = bool(payload.done)
 
     if payload.meta and isinstance(payload.meta, dict):
-        # merge meta
         current_meta = steps_obj[step_key].get("meta") or {}
         if not isinstance(current_meta, dict):
             current_meta = {}
@@ -213,7 +246,6 @@ def set_onboarding_step(
 
     steps_json = json.dumps(steps_obj)
 
-    # 3) upsert (IMPORTANT: CAST(:steps AS jsonb))
     try:
         db.execute(
             text(
@@ -237,8 +269,52 @@ def set_onboarding_step(
         )
 
     state = _compute_state(steps_obj)
+    show_modal = not admin_welcome_seen
+
     return {
         "ok": True,
         "tenant_id": int(tenant_id),
         **state,
+        "admin_welcome_seen": admin_welcome_seen,
+        "show_admin_welcome_modal": show_modal,
+    }
+
+
+@router.post("/onboarding/admin-welcome/seen", response_model=AdminWelcomeSeenResponse)
+def set_admin_welcome_seen(
+    payload: AdminWelcomeSeenPayload,
+    tenant_id: int = Depends(get_tenant_id_from_request),
+    db: Session = Depends(get_db),
+):
+    _ensure_onboarding_table(db)
+
+    # Ensure row exists
+    _get_or_create_onboarding_row(db, int(tenant_id))
+
+    try:
+        db.execute(
+            text(
+                """
+                update tenant_onboarding
+                   set admin_welcome_seen = :seen,
+                       updated_at = now()
+                 where tenant_id = :t
+                """
+            ),
+            {"t": int(tenant_id), "seen": bool(payload.seen)},
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update admin_welcome_seen: {type(e).__name__}: {str(e)}",
+        )
+
+    admin_welcome_seen = bool(payload.seen)
+    return {
+        "ok": True,
+        "tenant_id": int(tenant_id),
+        "admin_welcome_seen": admin_welcome_seen,
+        "show_admin_welcome_modal": not admin_welcome_seen,
     }
