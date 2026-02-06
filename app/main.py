@@ -17,6 +17,7 @@ from app.api.routes import admin_users
 from app.api.routes import onboarding
 from app.api.routes import emails
 from app.api.routes import kpis
+from app.api.routes import tenant
 
 
 app = FastAPI(title="Enrollait API")
@@ -48,3 +49,4 @@ app.include_router(admin_users.router, tags=["Admin Users"])
 app.include_router(onboarding.router, tags=["Onboarding"])
 app.include_router(emails.router, tags=["emails"])
 app.include_router(kpis.router, tags=["kpis"])
+app.include_router(tenant.router, tags=["Tenant"])

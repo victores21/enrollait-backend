@@ -171,15 +171,66 @@ def kpis_summary(
     }
 
 
+# @router.get("/kpis/revenue/daily")
+# def kpis_revenue_daily(
+#     tenant_id: int = Depends(get_tenant_id_from_request),
+#     db: Session = Depends(get_db),
+
+#     days: int = Query(30, ge=1, le=365),
+#     revenue_statuses: str = Query("paid,fulfilled", description="Comma-separated statuses counted as revenue"),
+# ) -> Dict[str, Any]:
+#     end = _utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+#     start = end - timedelta(days=days)
+
+#     statuses = [s.strip().lower() for s in (revenue_statuses or "").split(",") if s.strip()]
+#     if not statuses:
+#         statuses = ["paid", "fulfilled"]
+
+#     rows = db.execute(
+#         text("""
+#             select
+#               date_trunc('day', o.created_at) as day,
+#               coalesce(sum(o.total_cents), 0) as revenue_cents,
+#               count(*) as orders_count
+#             from orders o
+#             where o.tenant_id = :t
+#               and o.created_at >= :start
+#               and o.created_at <  :end
+#               and lower(o.status) = any(:statuses)
+#             group by 1
+#             order by 1 asc
+#         """),
+#         {"t": int(tenant_id), "start": start, "end": end, "statuses": statuses},
+#     ).fetchall()
+
+#     items: List[Dict[str, Any]] = []
+#     for r in rows or []:
+#         day = r[0]
+#         items.append(
+#             {
+#                 "day": day.date().isoformat() if hasattr(day, "date") else str(day),
+#                 "revenue_cents": int(r[1] or 0),
+#                 "orders_count": int(r[2] or 0),
+#             }
+#         )
+
+#     return {
+#         "ok": True,
+#         "tenant_id": int(tenant_id),
+#         "range": {"from": start.isoformat(), "to": end.isoformat()},
+#         "items": items,
+#         "meta": {"revenue_statuses": statuses},
+#     }
+
 @router.get("/kpis/revenue/daily")
 def kpis_revenue_daily(
     tenant_id: int = Depends(get_tenant_id_from_request),
     db: Session = Depends(get_db),
-
     days: int = Query(30, ge=1, le=365),
     revenue_statuses: str = Query("paid,fulfilled", description="Comma-separated statuses counted as revenue"),
 ) -> Dict[str, Any]:
-    end = _utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # ✅ include today by using tomorrow 00:00 as exclusive end
+    end = (_utc_now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=days)
 
     statuses = [s.strip().lower() for s in (revenue_statuses or "").split(",") if s.strip()]
@@ -196,7 +247,7 @@ def kpis_revenue_daily(
             where o.tenant_id = :t
               and o.created_at >= :start
               and o.created_at <  :end
-              and lower(o.status) = any(:statuses)
+              and lower(coalesce(o.status,'')) = any(:statuses)
             group by 1
             order by 1 asc
         """),
@@ -223,14 +274,56 @@ def kpis_revenue_daily(
     }
 
 
+# @router.get("/kpis/students/daily")
+# def kpis_students_daily(
+#     tenant_id: int = Depends(get_tenant_id_from_request),
+#     db: Session = Depends(get_db),
+
+#     days: int = Query(30, ge=1, le=365),
+# ) -> Dict[str, Any]:
+#     end = _utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+#     start = end - timedelta(days=days)
+
+#     rows = db.execute(
+#         text("""
+#             select
+#               date_trunc('day', um.created_at) as day,
+#               count(*) as new_students_count
+#             from user_map um
+#             where um.tenant_id = :t
+#               and um.created_at >= :start
+#               and um.created_at <  :end
+#             group by 1
+#             order by 1 asc
+#         """),
+#         {"t": int(tenant_id), "start": start, "end": end},
+#     ).fetchall()
+
+#     items: List[Dict[str, Any]] = []
+#     for r in rows or []:
+#         day = r[0]
+#         items.append(
+#             {
+#                 "day": day.date().isoformat() if hasattr(day, "date") else str(day),
+#                 "new_students_count": int(r[1] or 0),
+#             }
+#         )
+
+#     return {
+#         "ok": True,
+#         "tenant_id": int(tenant_id),
+#         "range": {"from": start.isoformat(), "to": end.isoformat()},
+#         "items": items,
+#     }
+
 @router.get("/kpis/students/daily")
 def kpis_students_daily(
     tenant_id: int = Depends(get_tenant_id_from_request),
     db: Session = Depends(get_db),
-
     days: int = Query(30, ge=1, le=365),
 ) -> Dict[str, Any]:
-    end = _utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # ✅ include today by using tomorrow 00:00 as exclusive end
+    end = (_utc_now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=days)
 
     rows = db.execute(
