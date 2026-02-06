@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from app.core.db import get_db
 from app.services.moodle import MoodleClient, MoodleError
-
+from app.services.welcome_course_email import send_welcome_course_email_for_tenant
 router = APIRouter()
 
 # -----------------------------------------------------------------------------
@@ -155,6 +155,26 @@ def _upsert_webhook_health(
     )
     # commit is handled by caller
 
+#----------------
+# Emails Helpers
+#-----------------
+
+def _try_mark_email_sent(db: Session, tenant_id: int, order_id: int, email_type: str) -> bool:
+    """
+    Returns True if we acquired the right to send (first time),
+    False if already sent before.
+    """
+    row = db.execute(
+        text("""
+            insert into order_email_events (tenant_id, order_id, email_type, sent_at)
+            values (:t, :oid, :et, now())
+            on conflict (order_id, email_type)
+            do nothing
+            returning id
+        """),
+        {"t": int(tenant_id), "oid": int(order_id), "et": str(email_type)},
+    ).fetchone()
+    return bool(row)
 
 # -----------------------------
 # Orders (STRICT)
@@ -759,6 +779,12 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             sig_header=sig_header,
             secret=webhook_secret,
         )
+        # define these AFTER construct_event
+        event_type = event.get("type")
+        event_id = event.get("id")
+        obj = (event.get("data") or {}).get("object") or {}
+        session_id = obj.get("id")
+                
         # ✅ mark "webhook verified" for this tenant (signature passed)
         try:
             _upsert_webhook_health(
@@ -861,6 +887,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         )
 
         # ✅ mark fulfilled on success
+        # if result.get("ok"):
+        #     try:
+        #         _set_order_status(db, int(oid), "fulfilled")
+        #         db.commit()
+        #     except Exception as e:
+        #         db.rollback()
+        #         _log("warn: failed to mark order fulfilled", "order", oid, type(e).__name__, str(e))
+        # ✅ mark fulfilled on success
         if result.get("ok"):
             try:
                 _set_order_status(db, int(oid), "fulfilled")
@@ -868,6 +902,42 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
             except Exception as e:
                 db.rollback()
                 _log("warn: failed to mark order fulfilled", "order", oid, type(e).__name__, str(e))
+
+            # ✅ send welcome email ONCE (idempotent)
+            try:
+                can_send = _try_mark_email_sent(db, int(tenant_id_db), int(oid), "welcome-course")
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                can_send = False
+                _log("warn: failed to mark welcome email sent:", type(e).__name__, str(e))
+
+            if can_send:
+                try:
+                    email_res = await send_welcome_course_email_for_tenant(
+                        db=db,
+                        tenant_id=int(tenant_id_db),
+                        order_id=int(oid),
+                    )
+                    # optionally store provider message id
+                    try:
+                        msg_id = (email_res.get("postmark") or {}).get("MessageID") or (email_res.get("postmark") or {}).get("message_id")
+                        if msg_id:
+                            db.execute(
+                                text("""
+                                    update order_email_events
+                                       set provider_message_id = :mid
+                                     where order_id = :oid
+                                       and email_type = 'welcome-course'
+                                """),
+                                {"mid": str(msg_id), "oid": int(oid)},
+                            )
+                            db.commit()
+                    except Exception:
+                        db.rollback()
+                except Exception as e:
+                    # IMPORTANT: don't fail the webhook just because email failed
+                    _log("warn: welcome email failed:", type(e).__name__, str(e))        
 
         return {
             "ok": True,
