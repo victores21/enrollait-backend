@@ -1,766 +1,63 @@
-# from decimal import Decimal, ROUND_HALF_UP
-# import re
-# from fastapi import APIRouter, Depends, Query
-# from pydantic import BaseModel, condecimal
-# from sqlalchemy import text
-# from sqlalchemy.orm import Session
-# from collections import defaultdict
-
-# from app.core.db import get_db
-
-# router = APIRouter()
-
-# # -----------------------------
-# # Helpers
-# # -----------------------------
-# _slug_re = re.compile(r"[^a-z0-9-]+")
-
-# ALLOWED_STOCK_STATUSES = {"available", "not_available"}
-
-
-# def slugify(value: str) -> str:
-#     value = (value or "").strip().lower()
-#     value = value.replace("_", "-").replace(" ", "-")
-#     value = _slug_re.sub("", value)
-#     value = re.sub(r"-{2,}", "-", value).strip("-")
-#     return value or "product"
-
-
-# def to_cents(price: Decimal) -> int:
-#     # Stripe expects integer cents. Avoid float bugs.
-#     return int((price * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-
-# def _ensure_products_table(db: Session) -> None:
-#     """
-#     Keeps your existing schema and adds missing columns safely.
-#     Existing: id, tenant_id, moodle_course_id, slug, price_cents, currency, is_published,
-#               created_at, price, title, description, updated_at
-
-#     New columns:
-#       - discounted_price numeric(10,2)
-#       - identifier text
-#       - stock_status text default 'available'
-#     """
-#     db.execute(text("""
-#         create table if not exists products (
-#           id bigserial primary key
-#         );
-#     """))
-#     db.commit()
-
-#     # Existing columns (best-effort, safe)
-#     db.execute(text("alter table products add column if not exists tenant_id bigint;"))
-#     db.execute(text("alter table products add column if not exists moodle_course_id bigint;"))
-#     db.execute(text("alter table products add column if not exists slug text;"))
-#     db.execute(text("alter table products add column if not exists price_cents int;"))
-#     db.execute(text("alter table products add column if not exists currency text default 'usd';"))
-#     db.execute(text("alter table products add column if not exists is_published boolean default false;"))
-#     db.execute(text("alter table products add column if not exists created_at timestamptz default now();"))
-#     db.execute(text("alter table products add column if not exists updated_at timestamptz default now();"))
-#     db.execute(text("alter table products add column if not exists price numeric(10,2);"))
-#     db.execute(text("alter table products add column if not exists title text;"))
-#     db.execute(text("alter table products add column if not exists description text;"))
-
-#     # NEW columns
-#     db.execute(text("alter table products add column if not exists discounted_price numeric(10,2);"))
-#     db.execute(text("alter table products add column if not exists identifier text;"))
-#     db.execute(text("alter table products add column if not exists stock_status text not null default 'available';"))
-#     db.execute(text("alter table products add column if not exists image_url text;"))
-#     db.commit()
-
-#     # Backfill price from price_cents when price is null
-#     db.execute(text("""
-#         update products
-#            set price = (price_cents::numeric / 100.0)
-#          where price is null and price_cents is not null;
-#     """))
-#     db.commit()
-
-#     # Ensure slug uniqueness per tenant (best-effort)
-#     try:
-#         db.execute(text("""
-#             do $$
-#             begin
-#               if not exists (
-#                 select 1
-#                   from pg_constraint
-#                  where conname = 'products_tenant_slug_uniq'
-#               ) then
-#                 alter table products
-#                 add constraint products_tenant_slug_uniq unique (tenant_id, slug);
-#               end if;
-#             end $$;
-#         """))
-#         db.commit()
-#     except Exception:
-#         db.rollback()
-
-
-# def _ensure_product_courses_table(db: Session):
-#     db.execute(text("""
-#         create table if not exists product_courses (
-#           id bigserial primary key,
-#           tenant_id bigint not null references tenants(id) on delete cascade,
-#           product_id bigint not null references products(id) on delete cascade,
-#           moodle_course_id bigint not null,
-#           created_at timestamptz not null default now(),
-#           unique (tenant_id, product_id, moodle_course_id)
-#         );
-#     """))
-#     db.commit()
-
-
-# def _ensure_related_products_table(db: Session):
-#     db.execute(text("""
-#         create table if not exists product_related (
-#           id bigserial primary key,
-#           tenant_id bigint not null references tenants(id) on delete cascade,
-#           product_id bigint not null references products(id) on delete cascade,
-#           related_product_id bigint not null references products(id) on delete cascade,
-#           created_at timestamptz not null default now(),
-#           unique (tenant_id, product_id, related_product_id),
-#           check (product_id <> related_product_id)
-#         );
-#     """))
-#     db.commit()
-
-
-# def _ensure_categories_tables(db: Session):
-#     # categories might already exist in your DB; this is safe.
-#     db.execute(text("""
-#         create table if not exists categories (
-#           id bigserial primary key,
-#           tenant_id bigint not null references tenants(id) on delete cascade,
-#           name text not null,
-#           slug text not null,
-#           created_at timestamptz not null default now(),
-#           unique (tenant_id, slug)
-#         );
-#     """))
-#     db.execute(text("""
-#         create table if not exists product_categories (
-#           id bigserial primary key,
-#           tenant_id bigint not null references tenants(id) on delete cascade,
-#           product_id bigint not null references products(id) on delete cascade,
-#           category_id bigint not null references categories(id) on delete cascade,
-#           created_at timestamptz not null default now(),
-#           unique (tenant_id, product_id, category_id)
-#         );
-#     """))
-#     db.commit()
-
-
-# def _parse_optional_price(value) -> Decimal | None:
-#     if value is None:
-#         return None
-#     d = Decimal(str(value))
-#     if d <= Decimal("0"):
-#         return None
-#     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-# def _normalize_category_ids(category_ids: list[int] | None) -> list[int] | None:
-#     if category_ids is None:
-#         return None
-#     ids = sorted({int(x) for x in category_ids if int(x) > 0})
-#     return ids  # can be [] meaning "clear all"
-
-
-# def _set_product_categories(db: Session, tenant_id: int, product_id: int, category_ids: list[int]) -> None:
-#     """
-#     MVP behavior: replace categories mapping for the product.
-#     - category_ids may be empty -> clears categories
-#     - validates category ids belong to the tenant
-#     NOTE: does NOT commit; caller controls transaction.
-#     """
-#     _ensure_categories_tables(db)
-
-#     # Always clear first (replace behavior)
-#     db.execute(
-#         text("delete from product_categories where tenant_id = :t and product_id = :p"),
-#         {"t": tenant_id, "p": product_id},
-#     )
-
-#     if not category_ids:
-#         return
-
-#     # Validate categories exist for tenant
-#     existing = db.execute(
-#         text("""
-#             select id
-#               from categories
-#              where tenant_id = :t
-#                and id = any(:ids)
-#         """),
-#         {"t": tenant_id, "ids": category_ids},
-#     ).fetchall()
-#     existing_ids = {int(r[0]) for r in existing}
-
-#     missing = [cid for cid in category_ids if cid not in existing_ids]
-#     if missing:
-#         raise ValueError(f"Invalid category_ids for tenant {tenant_id}: {missing}")
-
-#     db.execute(
-#         text("""
-#             insert into product_categories (tenant_id, product_id, category_id, created_at)
-#             values (:t, :p, :c, now())
-#             on conflict (tenant_id, product_id, category_id) do nothing
-#         """),
-#         [{"t": tenant_id, "p": product_id, "c": cid} for cid in category_ids],
-#     )
-
-
-# # -----------------------------
-# # Schemas
-# # -----------------------------
-# class CreateProductPayload(BaseModel):
-#     slug: str | None = None
-#     title: str | None = None
-#     description: str | None = None
-#     image_url: str | None = None
-#     price: condecimal(max_digits=10, decimal_places=2)
-#     discounted_price: condecimal(max_digits=10, decimal_places=2) | None = None
-
-#     currency: str = "usd"
-#     is_published: bool = False
-
-#     identifier: str | None = None
-#     stock_status: str = "available"
-
-#     moodle_course_id: int | None = None
-
-#     # NEW: set categories on create (ids from your categories table)
-#     category_ids: list[int] | None = None
-
-
-# class UpdateProductPayload(BaseModel):
-#     slug: str | None = None
-#     title: str | None = None
-#     description: str | None = None
-#     image_url: str | None = None
-#     price: condecimal(max_digits=10, decimal_places=2) | None = None
-#     discounted_price: condecimal(max_digits=10, decimal_places=2) | None = None
-
-#     currency: str | None = None
-#     is_published: bool | None = None
-
-#     identifier: str | None = None
-#     stock_status: str | None = None
-
-#     moodle_course_id: int | None = None
-
-#     # NEW: set categories on update (send [] to clear)
-#     category_ids: list[int] | None = None
-
-
-# # -----------------------------
-# # Routes
-# # -----------------------------
-# @router.post("/tenants/{tenant_id}/products")
-# def create_product(
-#     tenant_id: int,
-#     payload: CreateProductPayload,
-#     db: Session = Depends(get_db),
-# ):
-#     _ensure_products_table(db)
-
-#     raw = payload.slug or payload.title or "product"
-#     slug = slugify(raw)
-#     if not slug:
-#         return {"ok": False, "message": "slug/title required"}
-
-#     price = Decimal(str(payload.price))
-#     if price <= Decimal("0"):
-#         return {"ok": False, "message": "price must be > 0"}
-
-#     discounted = _parse_optional_price(payload.discounted_price)
-#     if discounted is not None and discounted >= price:
-#         return {"ok": False, "message": "discounted_price must be < price"}
-
-#     stock_status = (payload.stock_status or "available").strip().lower()
-#     if stock_status not in ALLOWED_STOCK_STATUSES:
-#         return {"ok": False, "message": f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}"}
-
-#     currency = (payload.currency or "usd").lower().strip()
-#     price_cents = to_cents(price)
-
-#     category_ids = _normalize_category_ids(payload.category_ids)
-
-#     try:
-#         row = db.execute(
-#             text("""
-#                 insert into products
-#                   (tenant_id, moodle_course_id, slug, title, description, image_url,
-#                    price, discounted_price, price_cents, currency, is_published,
-#                    identifier, stock_status, updated_at)
-#                 values
-#                   (:tenant_id, :moodle_course_id, :slug, :title, :description,
-#                    :image_url, :price, :discounted_price, :price_cents, :currency, :is_published,
-#                    :identifier, :stock_status, now())
-#                 returning
-#                   id, tenant_id, moodle_course_id, slug, title, description,
-#                   price, discounted_price, price_cents, currency, is_published,
-#                   identifier, stock_status, created_at
-#             """),
-#             {
-#                 "tenant_id": tenant_id,
-#                 "moodle_course_id": payload.moodle_course_id,
-#                 "slug": slug,
-#                 "title": payload.title,
-#                 "description": payload.description,
-#                 "image_url": payload.image_url,
-#                 "price": str(price),
-#                 "discounted_price": str(discounted) if discounted is not None else None,
-#                 "price_cents": price_cents,
-#                 "currency": currency,
-#                 "is_published": bool(payload.is_published),
-#                 "identifier": (payload.identifier or None),
-#                 "stock_status": stock_status,
-#             },
-#         ).fetchone()
-
-#         product_id = int(row[0])
-
-#         # NEW: categories on create
-#         if category_ids is not None:
-#             _set_product_categories(db, tenant_id, product_id, category_ids)
-
-#         db.commit()
-
-#     except ValueError as ve:
-#         db.rollback()
-#         return {"ok": False, "message": str(ve)}
-#     except Exception as e:
-#         db.rollback()
-#         return {"ok": False, "message": f"DB error: {type(e).__name__}: {str(e)}"}
-
-#     return {
-#         "ok": True,
-#         "product": {
-#             "id": int(row[0]),
-#             "tenant_id": int(row[1]),
-#             "moodle_course_id": int(row[2]) if row[2] is not None else None,
-#             "slug": row[3],
-#             "title": row[4],
-#             "description": row[5],
-#             "image_url": row[6],
-#             "price": str(row[7]) if row[7] is not None else None,
-#             "discounted_price": str(row[8]) if row[8] is not None else None,
-#             "price_cents": int(row[9]) if row[9] is not None else None,
-#             "currency": row[10],
-#             "is_published": bool(row[10]),
-#             "identifier": row[11],
-#             "stock_status": row[12],
-#             "created_at": str(row[13]),
-#             # optional: echo what was set
-#             "category_ids": category_ids if category_ids is not None else None,
-#         },
-#     }
-
-# @router.get("/tenants/{tenant_id}/products/paged")
-# def list_products_paged(
-#     tenant_id: int,
-#     page: int = Query(1, ge=1),
-#     page_size: int = Query(12, ge=1, le=100),
-#     published_only: bool = True,
-#     search: str | None = None,
-#     include_categories: bool = True,
-#     db: Session = Depends(get_db),
-# ):
-#     _ensure_products_table(db)
-#     if include_categories:
-#         _ensure_categories_tables(db)
-
-#     offset = (page - 1) * page_size
-
-#     where = ["tenant_id = :t"]
-#     params = {"t": tenant_id, "limit": page_size, "offset": offset}
-
-#     if published_only:
-#         where.append("is_published = true")
-
-#     if search and search.strip():
-#         params["q"] = f"%{search.strip().lower()}%"
-#         where.append("(lower(slug) like :q or lower(coalesce(title,'')) like :q)")
-
-#     where_sql = " and ".join(where)
-
-#     total = db.execute(
-#         text(f"select count(*) from products where {where_sql}"),
-#         params,
-#     ).scalar() or 0
-
-#     rows = db.execute(
-#         text(f"""
-#             select id, tenant_id, moodle_course_id, slug, title, description, image_url,
-#                    price, discounted_price, price_cents, currency, is_published,
-#                    identifier, stock_status, created_at
-#               from products
-#              where {where_sql}
-#              order by created_at desc
-#              limit :limit offset :offset
-#         """),
-#         params,
-#     ).fetchall()
-
-#     items = []
-#     product_ids: list[int] = []
-
-#     for r in rows:
-#         pid = int(r[0])
-#         product_ids.append(pid)
-#         items.append({
-#             "id": pid,
-#             "tenant_id": int(r[1]),
-#             "moodle_course_id": int(r[2]) if r[2] is not None else None,
-#             "slug": r[3],
-#             "title": r[4],
-#             "description": r[5],
-#             "image_url": r[6],
-#             "price": str(r[7]) if r[7] is not None else None,
-#             "discounted_price": str(r[8]) if r[8] is not None else None,
-#             "price_cents": int(r[9]) if r[9] is not None else None,
-#             "currency": r[10],
-#             "is_published": bool(r[11]),
-#             "identifier": r[12],
-#             "stock_status": r[13],
-#             "created_at": str(r[14]),
-#             "categories": [],
-#         })
-
-#     # Attach categories per product (single extra query, no N+1)
-#     if include_categories and product_ids:
-#         cat_rows = db.execute(
-#             text("""
-#                 select pc.product_id, c.id, c.name, c.slug
-#                   from product_categories pc
-#                   join categories c
-#                     on c.id = pc.category_id
-#                    and c.tenant_id = pc.tenant_id
-#                  where pc.tenant_id = :t
-#                    and pc.product_id = any(:pids)
-#                  order by c.name asc
-#             """),
-#             {"t": tenant_id, "pids": product_ids},
-#         ).fetchall()
-
-#         cats_by_product: dict[int, list[dict]] = defaultdict(list)
-#         for pr in cat_rows:
-#             cats_by_product[int(pr[0])].append({
-#                 "id": int(pr[1]),
-#                 "name": pr[2],
-#                 "slug": pr[3],
-#             })
-
-#         for item in items:
-#             item["categories"] = cats_by_product.get(item["id"], [])
-
-#     total_pages = (total + page_size - 1) // page_size
-
-#     return {
-#         "ok": True,
-#         "page": page,
-#         "page_size": page_size,
-#         "total": int(total),
-#         "total_pages": int(total_pages),
-#         "items": items,
-#     }
-
-
-# @router.get("/tenants/{tenant_id}/products/{product_id}")
-# def get_product_detail(
-#     tenant_id: int,
-#     product_id: int,
-#     include_courses: bool = True,
-#     include_related: bool = True,
-#     include_categories: bool = True,
-#     db: Session = Depends(get_db),
-# ):
-#     _ensure_products_table(db)
-
-#     row = db.execute(
-#         text("""
-#             select id, tenant_id, moodle_course_id, slug, title, description, image_url,
-#                    price, discounted_price, price_cents, currency, is_published,
-#                    identifier, stock_status, created_at
-#               from products
-#              where tenant_id = :t and id = :id
-#              limit 1
-#         """),
-#         {"t": tenant_id, "id": product_id},
-#     ).fetchone()
-
-#     if not row:
-#         return {"ok": False, "message": "Product not found", "tenant_id": tenant_id, "product_id": product_id}
-
-#     product = {
-#         "id": int(row[0]),
-#         "tenant_id": int(row[1]),
-#         "moodle_course_id": int(row[2]) if row[2] is not None else None,
-#         "slug": row[3],
-#         "title": row[4],
-#         "description": row[5],
-#         "image_url": row[6],
-#         "price": str(row[7]) if row[7] is not None else None,
-#         "discounted_price": str(row[8]) if row[8] is not None else None,
-#         "price_cents": int(row[9]) if row[9] is not None else None,
-#         "currency": row[10],
-#         "is_published": bool(row[11]),
-#         "identifier": row[12],
-#         "stock_status": row[13],
-#         "created_at": str(row[14]),
-#     }
-
-#     if include_courses:
-#         _ensure_product_courses_table(db)
-#         linked = db.execute(
-#             text("""
-#                 select pc.moodle_course_id, c.fullname, c.summary
-#                   from product_courses pc
-#                   left join courses c
-#                     on c.tenant_id = pc.tenant_id and c.moodle_course_id = pc.moodle_course_id
-#                  where pc.tenant_id = :t and pc.product_id = :p
-#                  order by pc.moodle_course_id asc
-#             """),
-#             {"t": tenant_id, "p": product_id},
-#         ).fetchall()
-
-#         product["courses"] = [{
-#             "moodle_course_id": int(r[0]),
-#             "fullname": r[1],
-#             "summary": r[2],
-#         } for r in linked]
-
-#     if include_related:
-#         _ensure_related_products_table(db)
-#         related_rows = db.execute(
-#             text("""
-#                 select p2.id, p2.slug, p2.title, p2.description, p2.image_url, p2.price, p2.discounted_price, p2.currency, p2.is_published, p2.stock_status
-#                   from product_related pr
-#                   join products p2
-#                     on p2.id = pr.related_product_id and p2.tenant_id = pr.tenant_id
-#                  where pr.tenant_id = :t and pr.product_id = :p
-#                  order by pr.created_at desc
-#             """),
-#             {"t": tenant_id, "p": product_id},
-#         ).fetchall()
-
-#         product["related_products"] = [{
-#             "id": int(r[0]),
-#             "slug": r[1],
-#             "title": r[2],
-#             "description": r[3],
-#             "image_url": r[4],
-#             "price": str(r[4]) if r[4] is not None else None,
-#             "discounted_price": str(r[5]) if r[5] is not None else None,
-#             "currency": r[6],
-#             "is_published": bool(r[7]),
-#             "stock_status": r[8],
-#         } for r in related_rows]
-
-#     if include_categories:
-#         _ensure_categories_tables(db)
-#         cat_rows = db.execute(
-#             text("""
-#                 select c.id, c.name, c.slug
-#                   from product_categories pc
-#                   join categories c
-#                     on c.id = pc.category_id and c.tenant_id = pc.tenant_id
-#                  where pc.tenant_id = :t and pc.product_id = :p
-#                  order by c.name asc
-#             """),
-#             {"t": tenant_id, "p": product_id},
-#         ).fetchall()
-
-#         product["categories"] = [{
-#             "id": int(r[0]),
-#             "name": r[1],
-#             "slug": r[2],
-#         } for r in cat_rows]
-
-#     return {"ok": True, "product": product}
-
-
-# @router.patch("/tenants/{tenant_id}/products/{product_id}")
-# def update_product(
-#     tenant_id: int,
-#     product_id: int,
-#     payload: UpdateProductPayload,
-#     db: Session = Depends(get_db),
-# ):
-#     _ensure_products_table(db)
-
-#     prod = db.execute(
-#         text("select id from products where id=:p and tenant_id=:t"),
-#         {"p": product_id, "t": tenant_id},
-#     ).fetchone()
-#     if not prod:
-#         return {"ok": False, "message": "Product not found for this tenant"}
-
-#     updates = {}
-#     sets = []
-
-#     if payload.slug is not None:
-#         updates["slug"] = slugify(payload.slug)
-#         sets.append("slug = :slug")
-
-#     if payload.title is not None:
-#         updates["title"] = payload.title
-#         sets.append("title = :title")
-
-#     if payload.description is not None:
-#         updates["description"] = payload.description
-#         sets.append("description = :description")
-
-#     if payload.image_url is not None:
-#         updates["image_url"] = payload.image_url.strip() if payload.image_url else None
-#         sets.append("image_url = :image_url")        
-
-#     if payload.price is not None:
-#         price = Decimal(str(payload.price))
-#         if price <= Decimal("0"):
-#             return {"ok": False, "message": "price must be > 0"}
-#         updates["price"] = str(price)
-#         updates["price_cents"] = to_cents(price)
-#         sets.append("price = :price")
-#         sets.append("price_cents = :price_cents")
-
-#     # discounted_price:
-#     # - If client wants to clear it, they must send discounted_price: null.
-#     #   But pydantic sets it to None, and you can't distinguish "not sent" vs "sent null"
-#     #   unless you use model_fields_set. We'll handle both:
-#     if "discounted_price" in getattr(payload, "model_fields_set", set()):
-#         discounted = _parse_optional_price(payload.discounted_price)
-#         current_price = None
-#         if payload.price is None:
-#             current_price = db.execute(
-#                 text("select price from products where tenant_id=:t and id=:p"),
-#                 {"t": tenant_id, "p": product_id},
-#             ).scalar()
-#         base_price = Decimal(str(payload.price)) if payload.price is not None else (Decimal(str(current_price)) if current_price is not None else None)
-#         if base_price is not None and discounted is not None and discounted >= base_price:
-#             return {"ok": False, "message": "discounted_price must be < price"}
-#         updates["discounted_price"] = str(discounted) if discounted is not None else None
-#         sets.append("discounted_price = :discounted_price")
-
-#     if payload.currency is not None:
-#         updates["currency"] = payload.currency.lower().strip()
-#         sets.append("currency = :currency")
-
-#     if payload.is_published is not None:
-#         updates["is_published"] = bool(payload.is_published)
-#         sets.append("is_published = :is_published")
-
-#     if payload.identifier is not None:
-#         updates["identifier"] = payload.identifier.strip() if payload.identifier else None
-#         sets.append("identifier = :identifier")
-
-#     if payload.stock_status is not None:
-#         stock_status = payload.stock_status.strip().lower()
-#         if stock_status not in ALLOWED_STOCK_STATUSES:
-#             return {"ok": False, "message": f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}"}
-#         updates["stock_status"] = stock_status
-#         sets.append("stock_status = :stock_status")
-
-#     if payload.moodle_course_id is not None:
-#         updates["moodle_course_id"] = payload.moodle_course_id
-#         sets.append("moodle_course_id = :moodle_course_id")
-
-#     category_ids = _normalize_category_ids(payload.category_ids)
-
-#     if not sets and category_ids is None:
-#         return {"ok": False, "message": "No fields to update"}
-
-#     updates["tenant_id"] = tenant_id
-#     updates["product_id"] = product_id
-
-#     try:
-#         # Update product fields if any
-#         row = None
-#         if sets:
-#             row = db.execute(
-#                 text(f"""
-#                     update products
-#                        set {", ".join(sets)}, updated_at = now()
-#                      where id = :product_id and tenant_id = :tenant_id
-#                     returning id, tenant_id, moodle_course_id, slug, title, description,
-#                               image_url, price, discounted_price, price_cents, currency, is_published,
-#                               identifier, stock_status, created_at
-#                 """),
-#                 updates,
-#             ).fetchone()
-
-#         # NEW: categories on update (send [] to clear)
-#         if category_ids is not None:
-#             _set_product_categories(db, tenant_id, product_id, category_ids)
-
-#         # If only categories were changed, fetch row now
-#         if row is None:
-#             row = db.execute(
-#                 text("""
-#                     select id, tenant_id, moodle_course_id, slug, title, description,
-#                            image_url, price, discounted_price, price_cents, currency, is_published,
-#                            identifier, stock_status, created_at
-#                       from products
-#                      where tenant_id = :t and id = :p
-#                      limit 1
-#                 """),
-#                 {"t": tenant_id, "p": product_id},
-#             ).fetchone()
-
-#         db.commit()
-
-#     except ValueError as ve:
-#         db.rollback()
-#         return {"ok": False, "message": str(ve)}
-#     except Exception as e:
-#         db.rollback()
-#         return {"ok": False, "message": f"DB error: {type(e).__name__}: {str(e)}"}
-
-#     return {
-#         "ok": True,
-#         "product": {
-#             "id": int(row[0]),
-#             "tenant_id": int(row[1]),
-#             "moodle_course_id": int(row[2]) if row[2] is not None else None,
-#             "slug": row[3],
-#             "title": row[4],
-#             "description": row[5],
-#             "image_url": row[6],
-#             "price": str(row[7]) if row[7] is not None else None,
-#             "discounted_price": str(row[8]) if row[8] is not None else None,
-#             "price_cents": int(row[9]) if row[9] is not None else None,
-#             "currency": row[10],
-#             "is_published": bool(row[11]),
-#             "identifier": row[12],
-#             "stock_status": row[13],
-#             "created_at": str(row[14]),
-#             "category_ids": category_ids if category_ids is not None else None,
-#         },
-#     }
+from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
+import json
 import re
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, condecimal
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from uuid import uuid4
 from collections import defaultdict
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    Query,
+    Form,
+    UploadFile,
+    File,
+    HTTPException,
+    status,
+)
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+
 from app.core.db import get_db
-from app.core.tenant import get_tenant_id_from_request  # ✅ tenant resolver
+from app.core.tenant import get_tenant_id_from_request
+from app.core.supabase import upload_product_image
+
+# ✅ NEW (recommended): sanitize HTML before storing to prevent XSS
+import bleach
 
 router = APIRouter()
 
-# -----------------------------
-# Helpers
-# -----------------------------
 _slug_re = re.compile(r"[^a-z0-9-]+")
-
 ALLOWED_STOCK_STATUSES = {"available", "not_available"}
 
+# ✅ NEW: HTML constraints + sanitizer allowlist
+MAX_HTML_LEN = 50_000  # adjust as you like
 
+_ALLOWED_TAGS = [
+    "p", "br", "strong", "b", "em", "i", "u", "s",
+    "ul", "ol", "li",
+    "h1", "h2", "h3", "h4",
+    "blockquote",
+    "a", "span",
+    "code", "pre",
+    "hr",
+    "img",
+]
+_ALLOWED_ATTRS = {
+    "a": ["href", "title", "target", "rel"],
+    "img": ["src", "alt", "title", "width", "height"],
+    "span": ["style"],
+    "p": ["style"],
+    "h1": ["style"], "h2": ["style"], "h3": ["style"], "h4": ["style"],
+}
+_ALLOWED_PROTOCOLS = ["http", "https", "mailto"]
+
+
+# -----------------------------
+# Small helpers
+# -----------------------------
 def slugify(value: str) -> str:
     value = (value or "").strip().lower()
     value = value.replace("_", "-").replace(" ", "-")
@@ -770,128 +67,7 @@ def slugify(value: str) -> str:
 
 
 def to_cents(price: Decimal) -> int:
-    # Stripe expects integer cents. Avoid float bugs.
     return int((price * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-
-
-def _ensure_products_table(db: Session) -> None:
-    """
-    Keeps your existing schema and adds missing columns safely.
-    Existing: id, tenant_id, moodle_course_id, slug, price_cents, currency, is_published,
-              created_at, price, title, description, updated_at
-
-    New columns:
-      - discounted_price numeric(10,2)
-      - identifier text
-      - stock_status text default 'available'
-    """
-    db.execute(text("""
-        create table if not exists products (
-          id bigserial primary key
-        );
-    """))
-    db.commit()
-
-    # Existing columns (best-effort, safe)
-    db.execute(text("alter table products add column if not exists tenant_id bigint;"))
-    db.execute(text("alter table products add column if not exists moodle_course_id bigint;"))
-    db.execute(text("alter table products add column if not exists slug text;"))
-    db.execute(text("alter table products add column if not exists price_cents int;"))
-    db.execute(text("alter table products add column if not exists currency text default 'usd';"))
-    db.execute(text("alter table products add column if not exists is_published boolean default false;"))
-    db.execute(text("alter table products add column if not exists created_at timestamptz default now();"))
-    db.execute(text("alter table products add column if not exists updated_at timestamptz default now();"))
-    db.execute(text("alter table products add column if not exists price numeric(10,2);"))
-    db.execute(text("alter table products add column if not exists title text;"))
-    db.execute(text("alter table products add column if not exists description text;"))
-
-    # NEW columns
-    db.execute(text("alter table products add column if not exists discounted_price numeric(10,2);"))
-    db.execute(text("alter table products add column if not exists identifier text;"))
-    db.execute(text("alter table products add column if not exists stock_status text not null default 'available';"))
-    db.execute(text("alter table products add column if not exists image_url text;"))
-    db.commit()
-
-    # Backfill price from price_cents when price is null
-    db.execute(text("""
-        update products
-           set price = (price_cents::numeric / 100.0)
-         where price is null and price_cents is not null;
-    """))
-    db.commit()
-
-    # Ensure slug uniqueness per tenant (best-effort)
-    try:
-        db.execute(text("""
-            do $$
-            begin
-              if not exists (
-                select 1
-                  from pg_constraint
-                 where conname = 'products_tenant_slug_uniq'
-              ) then
-                alter table products
-                add constraint products_tenant_slug_uniq unique (tenant_id, slug);
-              end if;
-            end $$;
-        """))
-        db.commit()
-    except Exception:
-        db.rollback()
-
-
-def _ensure_product_courses_table(db: Session):
-    db.execute(text("""
-        create table if not exists product_courses (
-          id bigserial primary key,
-          tenant_id bigint not null references tenants(id) on delete cascade,
-          product_id bigint not null references products(id) on delete cascade,
-          moodle_course_id bigint not null,
-          created_at timestamptz not null default now(),
-          unique (tenant_id, product_id, moodle_course_id)
-        );
-    """))
-    db.commit()
-
-
-def _ensure_related_products_table(db: Session):
-    db.execute(text("""
-        create table if not exists product_related (
-          id bigserial primary key,
-          tenant_id bigint not null references tenants(id) on delete cascade,
-          product_id bigint not null references products(id) on delete cascade,
-          related_product_id bigint not null references products(id) on delete cascade,
-          created_at timestamptz not null default now(),
-          unique (tenant_id, product_id, related_product_id),
-          check (product_id <> related_product_id)
-        );
-    """))
-    db.commit()
-
-
-def _ensure_categories_tables(db: Session):
-    # categories might already exist in your DB; this is safe.
-    db.execute(text("""
-        create table if not exists categories (
-          id bigserial primary key,
-          tenant_id bigint not null references tenants(id) on delete cascade,
-          name text not null,
-          slug text not null,
-          created_at timestamptz not null default now(),
-          unique (tenant_id, slug)
-        );
-    """))
-    db.execute(text("""
-        create table if not exists product_categories (
-          id bigserial primary key,
-          tenant_id bigint not null references tenants(id) on delete cascade,
-          product_id bigint not null references products(id) on delete cascade,
-          category_id bigint not null references categories(id) on delete cascade,
-          created_at timestamptz not null default now(),
-          unique (tenant_id, product_id, category_id)
-        );
-    """))
-    db.commit()
 
 
 def _parse_optional_price(value) -> Decimal | None:
@@ -903,23 +79,313 @@ def _parse_optional_price(value) -> Decimal | None:
     return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def _normalize_category_ids(category_ids: list[int] | None) -> list[int] | None:
-    if category_ids is None:
+def _parse_optional_bool(raw: str | None) -> bool | None:
+    if raw is None:
         return None
-    ids = sorted({int(x) for x in category_ids if int(x) > 0})
-    return ids  # can be [] meaning "clear all"
+    v = str(raw).strip().lower()
+    if v in ("true", "1", "yes", "y", "on"):
+        return True
+    if v in ("false", "0", "no", "n", "off"):
+        return False
+    raise HTTPException(
+        status_code=400, detail="is_published must be a boolean (true/false)"
+    )
 
 
-def _set_product_categories(db: Session, tenant_id: int, product_id: int, category_ids: list[int]) -> None:
+def _row_price_to_decimal(row_price, row_price_cents) -> Decimal:
+    if row_price is not None:
+        try:
+            return Decimal(str(row_price))
+        except Exception:
+            pass
+    try:
+        cents = int(row_price_cents or 0)
+        return (Decimal(cents) / Decimal("100")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    except Exception:
+        return Decimal("0.00")
+
+
+def _parse_ids_json(name: str, raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "":
+        return None
+
+    try:
+        value = json.loads(raw)
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be a JSON array string like [1,2,3]"
+        )
+
+    if not isinstance(value, list):
+        raise HTTPException(status_code=400, detail=f"{name} must be a JSON array")
+
+    try:
+        ids = sorted({int(x) for x in value if int(x) > 0})
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be an array of integers"
+        )
+
+    return ids
+
+
+# -----------------------------
+# ✅ NEW: Long HTML description sanitizer
+# -----------------------------
+def sanitize_html(raw: str | None) -> str | None:
     """
-    MVP behavior: replace categories mapping for the product.
-    - category_ids may be empty -> clears categories
-    - validates category ids belong to the tenant
-    NOTE: does NOT commit; caller controls transaction.
+    Store only sanitized HTML to prevent XSS.
+    - None => keep as None
+    - ""   => None
+    - Too large => 400
     """
-    _ensure_categories_tables(db)
+    if raw is None:
+        return None
 
-    # Always clear first (replace behavior)
+    raw = raw.strip()
+    if raw == "":
+        return None
+
+    if len(raw) > MAX_HTML_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"long_description_html too large (max {MAX_HTML_LEN} chars)",
+        )
+
+    cleaned = bleach.clean(
+        raw,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRS,
+        protocols=_ALLOWED_PROTOCOLS,
+        strip=True,
+    )
+
+    # Make links safer (adds rel=nofollow, etc.)
+    cleaned = bleach.linkify(cleaned, callbacks=[bleach.callbacks.nofollow])
+
+    return cleaned
+
+
+# -----------------------------
+# "What you'll learn" helpers
+# -----------------------------
+def _parse_learning_outcomes(raw: str | None) -> list[str] | None:
+    """
+    Accepts:
+      - JSON array string: ["a","b","c"]
+      - Newline separated text: "a\\nb\\nc"
+    Returns:
+      - None if not provided
+      - [] if explicitly empty (clears all)
+      - list[str] otherwise
+    """
+    if raw is None:
+        return None
+
+    raw = raw.strip()
+    if raw == "":
+        return []  # explicit clear
+
+    # JSON first
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            items: list[str] = []
+            for x in v:
+                s = str(x).strip()
+                if s:
+                    items.append(s)
+            # de-dupe preserving order
+            return list(dict.fromkeys(items))
+    except Exception:
+        pass
+
+    # fallback: newline separated
+    items = [line.strip() for line in raw.splitlines() if line.strip()]
+    return list(dict.fromkeys(items))
+
+
+def _set_product_learning_outcomes(
+    db: Session, tenant_id: int, product_id: int, outcomes: list[str]
+) -> None:
+    """
+    Replace-all:
+      - delete old outcomes for product
+      - insert new ones with position 1..N
+    """
+    db.execute(
+        text(
+            """
+            delete from product_learning_outcomes
+             where tenant_id = :t and product_id = :p
+            """
+        ),
+        {"t": int(tenant_id), "p": int(product_id)},
+    )
+
+    if not outcomes:
+        return
+
+    cleaned: list[str] = []
+    for s in outcomes:
+        s2 = (s or "").strip()
+        if not s2:
+            continue
+        if len(s2) > 220:
+            raise ValueError("Each learning outcome must be <= 220 characters")
+        cleaned.append(s2)
+
+    if not cleaned:
+        return
+
+    db.execute(
+        text(
+            """
+            insert into product_learning_outcomes (tenant_id, product_id, position, text)
+            select :t, :p, u.pos, u.txt
+              from unnest(CAST(:items AS text[])) with ordinality as u(txt, pos)
+            """
+        ),
+        {"t": int(tenant_id), "p": int(product_id), "items": cleaned},
+    )
+
+
+def _get_product_learning_outcomes(
+    db: Session, tenant_id: int, product_id: int
+) -> list[str]:
+    rows = db.execute(
+        text(
+            """
+            select text
+              from product_learning_outcomes
+             where tenant_id = :t and product_id = :p
+             order by position asc, id asc
+            """
+        ),
+        {"t": int(tenant_id), "p": int(product_id)},
+    ).fetchall()
+    return [r[0] for r in rows if r and r[0]]
+
+
+# -----------------------------
+# Image upload helpers
+# -----------------------------
+def _ext_from_content_type(content_type: str) -> str:
+    ct = (content_type or "").lower()
+    if ct == "image/png":
+        return ".png"
+    if ct in ("image/jpeg", "image/jpg"):
+        return ".jpg"
+    if ct == "image/webp":
+        return ".webp"
+    return ""
+
+
+def _validate_image_bytes(image: UploadFile, data: bytes, max_mb: int = 5) -> None:
+    allowed = {"image/png", "image/jpeg", "image/webp"}
+    if not image.content_type or image.content_type.lower() not in allowed:
+        raise HTTPException(status_code=400, detail="image must be png, jpg, or webp")
+
+    max_bytes = max_mb * 1024 * 1024
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=400, detail=f"image too large (max {max_mb}MB)"
+        )
+
+
+def _make_storage_key(tenant_id: int, product_id: int, content_type: str) -> str:
+    ext = _ext_from_content_type(content_type) or ".bin"
+    return f"tenants/{tenant_id}/products/{product_id}/{uuid4().hex}{ext}"
+
+
+def _extract_public_url(res) -> str | None:
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict):
+        return res.get("public_url") or res.get("url") or res.get("publicUrl")
+    return None
+
+
+def _upload_to_supabase(image: UploadFile, data: bytes, key: str) -> str:
+    """
+    Keep compatibility with multiple helper signatures.
+    """
+    attempts = [
+        lambda: upload_product_image(image, key),
+        lambda: upload_product_image(image, key, image.content_type),
+        lambda: upload_product_image(data, key),
+        lambda: upload_product_image(data, key, image.content_type),
+    ]
+
+    last_err: Exception | None = None
+    for fn in attempts:
+        try:
+            res = fn()
+            url = _extract_public_url(res)
+            if not url:
+                raise RuntimeError("upload_product_image did not return a public url")
+            return url
+        except TypeError as e:
+            last_err = e
+            continue
+
+    raise TypeError(
+        f"upload_product_image signature mismatch. Last error: {last_err}"
+    )
+
+
+# -----------------------------
+# Relation setters (optimized)
+# -----------------------------
+def _validate_ids_exist(db: Session, tenant_id: int, table: str, ids: list[int]) -> None:
+    if not ids:
+        return
+    rows = db.execute(
+        text(
+            f"select id from {table} where tenant_id = :t and id = any(CAST(:ids AS bigint[]))"
+        ),
+        {"t": tenant_id, "ids": ids},
+    ).fetchall()
+    existing = {int(r[0]) for r in rows}
+    missing = [x for x in ids if x not in existing]
+    if missing:
+        raise ValueError(f"Invalid {table} ids for tenant {tenant_id}: {missing}")
+
+
+def _set_product_courses(
+    db: Session, tenant_id: int, product_id: int, course_ids: list[int]
+) -> None:
+    db.execute(
+        text("delete from product_courses where tenant_id = :t and product_id = :p"),
+        {"t": tenant_id, "p": product_id},
+    )
+
+    if not course_ids:
+        return
+
+    _validate_ids_exist(db, tenant_id, "courses", course_ids)
+
+    db.execute(
+        text(
+            """
+            insert into product_courses (tenant_id, product_id, course_id)
+            select :t, :p, x
+              from unnest(CAST(:ids AS bigint[])) as x
+            on conflict (tenant_id, product_id, course_id) do nothing
+        """
+        ),
+        {"t": tenant_id, "p": product_id, "ids": course_ids},
+    )
+
+
+def _set_product_categories(
+    db: Session, tenant_id: int, product_id: int, category_ids: list[int]
+) -> None:
     db.execute(
         text("delete from product_categories where tenant_id = :t and product_id = :p"),
         {"t": tenant_id, "p": product_id},
@@ -928,167 +394,219 @@ def _set_product_categories(db: Session, tenant_id: int, product_id: int, catego
     if not category_ids:
         return
 
-    # Validate categories exist for tenant
-    existing = db.execute(
-        text("""
-            select id
-              from categories
-             where tenant_id = :t
-               and id = any(:ids)
-        """),
-        {"t": tenant_id, "ids": category_ids},
-    ).fetchall()
-    existing_ids = {int(r[0]) for r in existing}
-
-    missing = [cid for cid in category_ids if cid not in existing_ids]
-    if missing:
-        raise ValueError(f"Invalid category_ids for tenant {tenant_id}: {missing}")
+    _validate_ids_exist(db, tenant_id, "categories", category_ids)
 
     db.execute(
-        text("""
+        text(
+            """
             insert into product_categories (tenant_id, product_id, category_id, created_at)
-            values (:t, :p, :c, now())
+            select :t, :p, x, now()
+              from unnest(CAST(:ids AS bigint[])) as x
             on conflict (tenant_id, product_id, category_id) do nothing
-        """),
-        [{"t": tenant_id, "p": product_id, "c": cid} for cid in category_ids],
+        """
+        ),
+        {"t": tenant_id, "p": product_id, "ids": category_ids},
     )
 
 
-# -----------------------------
-# Schemas
-# -----------------------------
-class CreateProductPayload(BaseModel):
-    slug: str | None = None
-    title: str | None = None
-    description: str | None = None
-    image_url: str | None = None
-    price: condecimal(max_digits=10, decimal_places=2)
-    discounted_price: condecimal(max_digits=10, decimal_places=2) | None = None
+def _set_related_products(
+    db: Session, tenant_id: int, product_id: int, related_product_ids: list[int]
+) -> None:
+    db.execute(
+        text("delete from product_related where tenant_id = :t and product_id = :p"),
+        {"t": tenant_id, "p": product_id},
+    )
 
-    currency: str = "usd"
-    is_published: bool = False
+    if not related_product_ids:
+        return
 
-    identifier: str | None = None
-    stock_status: str = "available"
+    if product_id in related_product_ids:
+        raise ValueError("related_product_ids cannot include the same product_id")
 
-    moodle_course_id: int | None = None
+    _validate_ids_exist(db, tenant_id, "products", related_product_ids)
 
-    # NEW: set categories on create (ids from your categories table)
-    category_ids: list[int] | None = None
-
-
-class UpdateProductPayload(BaseModel):
-    slug: str | None = None
-    title: str | None = None
-    description: str | None = None
-    image_url: str | None = None
-    price: condecimal(max_digits=10, decimal_places=2) | None = None
-    discounted_price: condecimal(max_digits=10, decimal_places=2) | None = None
-
-    currency: str | None = None
-    is_published: bool | None = None
-
-    identifier: str | None = None
-    stock_status: str | None = None
-
-    moodle_course_id: int | None = None
-
-    # NEW: set categories on update (send [] to clear)
-    category_ids: list[int] | None = None
+    db.execute(
+        text(
+            """
+            insert into product_related (tenant_id, product_id, related_product_id, created_at)
+            select :t, :p, x, now()
+              from unnest(CAST(:ids AS bigint[])) as x
+            on conflict (tenant_id, product_id, related_product_id) do nothing
+        """
+        ),
+        {"t": tenant_id, "p": product_id, "ids": related_product_ids},
+    )
 
 
 # -----------------------------
 # Routes
 # -----------------------------
-
-# ✅ CHANGE: remove /tenants/{tenant_id} from the path and infer tenant from request
-@router.post("/products")
+@router.post("/products", status_code=status.HTTP_201_CREATED)
 def create_product(
-    payload: CreateProductPayload,
-    tenant_id: int = Depends(get_tenant_id_from_request),  # ✅ inferred tenant
+    tenant_id: int = Depends(get_tenant_id_from_request),
     db: Session = Depends(get_db),
+    title: str = Form(...),
+    price: str = Form(...),
+    description: str | None = Form(None),
+    # ✅ NEW: long html description stored in products.long_description_html
+    long_description_html: str | None = Form(None),
+    discounted_price: str | None = Form(None),
+    currency: str = Form("usd"),
+    identifier: str | None = Form(None),
+    stock_status: str = Form("available"),
+    course_ids: str | None = Form(None),
+    category_ids: str | None = Form(None),
+    learning_outcomes: str | None = Form(None),
+    image: UploadFile | None = File(None),
 ):
-    _ensure_products_table(db)
+    title_clean = (title or "").strip()
+    if not title_clean:
+        raise HTTPException(status_code=400, detail="title is required")
 
-    raw = payload.slug or payload.title or "product"
-    slug = slugify(raw)
-    if not slug:
-        return {"ok": False, "message": "slug/title required"}
+    slug = slugify(title_clean)
 
-    price = Decimal(str(payload.price))
-    if price <= Decimal("0"):
-        return {"ok": False, "message": "price must be > 0"}
+    try:
+        price_dec = Decimal(str(price))
+    except Exception:
+        raise HTTPException(status_code=400, detail="price must be a valid number")
+    if price_dec <= Decimal("0"):
+        raise HTTPException(status_code=400, detail="price must be > 0")
 
-    discounted = _parse_optional_price(payload.discounted_price)
-    if discounted is not None and discounted >= price:
-        return {"ok": False, "message": "discounted_price must be < price"}
+    discounted_dec: Decimal | None = None
+    if discounted_price is not None and str(discounted_price).strip() != "":
+        discounted_dec = _parse_optional_price(discounted_price)
+        if discounted_dec is not None and discounted_dec >= price_dec:
+            raise HTTPException(
+                status_code=400, detail="discounted_price must be < price"
+            )
 
-    stock_status = (payload.stock_status or "available").strip().lower()
-    if stock_status not in ALLOWED_STOCK_STATUSES:
-        return {"ok": False, "message": f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}"}
+    stock_status_clean = (stock_status or "available").strip().lower()
+    if stock_status_clean not in ALLOWED_STOCK_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}",
+        )
 
-    currency = (payload.currency or "usd").lower().strip()
-    price_cents = to_cents(price)
+    currency_clean = (currency or "usd").lower().strip() or "usd"
+    price_cents = to_cents(price_dec)
 
-    category_ids = _normalize_category_ids(payload.category_ids)
+    parsed_course_ids = _parse_ids_json("course_ids", course_ids)
+    parsed_category_ids = _parse_ids_json("category_ids", category_ids)
+    parsed_learning_outcomes = _parse_learning_outcomes(learning_outcomes)
+
+    # ✅ NEW: sanitize html before saving
+    long_html_clean = sanitize_html(long_description_html)
+
+    image_bytes: bytes | None = None
+    if image is not None:
+        image_bytes = image.file.read()
+        _validate_image_bytes(image, image_bytes, max_mb=5)
+
+    image_url: str | None = None
 
     try:
         row = db.execute(
-            text("""
+            text(
+                """
                 insert into products
-                  (tenant_id, moodle_course_id, slug, title, description, image_url,
+                  (tenant_id, slug, title, description, long_description_html, image_url,
                    price, discounted_price, price_cents, currency, is_published,
                    identifier, stock_status, updated_at)
                 values
-                  (:tenant_id, :moodle_course_id, :slug, :title, :description,
-                   :image_url, :price, :discounted_price, :price_cents, :currency, :is_published,
+                  (:tenant_id, :slug, :title, :description, :long_description_html, null,
+                   :price, :discounted_price, :price_cents, :currency,
+                   false,
                    :identifier, :stock_status, now())
                 returning
-                  id, tenant_id, moodle_course_id, slug, title, description,
+                  id, tenant_id, slug, title, description, long_description_html,
                   image_url, price, discounted_price, price_cents, currency, is_published,
                   identifier, stock_status, created_at
-            """),
+            """
+            ),
             {
                 "tenant_id": tenant_id,
-                "moodle_course_id": payload.moodle_course_id,
                 "slug": slug,
-                "title": payload.title,
-                "description": payload.description,
-                "image_url": payload.image_url,
-                "price": str(price),
-                "discounted_price": str(discounted) if discounted is not None else None,
+                "title": title_clean,
+                "description": description if description is not None else None,
+                "long_description_html": long_html_clean,
+                "price": str(price_dec),
+                "discounted_price": str(discounted_dec) if discounted_dec is not None else None,
                 "price_cents": price_cents,
-                "currency": currency,
-                "is_published": bool(payload.is_published),
-                "identifier": (payload.identifier or None),
-                "stock_status": stock_status,
+                "currency": currency_clean,
+                "identifier": identifier.strip() if identifier else None,
+                "stock_status": stock_status_clean,
             },
         ).fetchone()
 
         product_id = int(row[0])
 
-        if category_ids is not None:
-            _set_product_categories(db, tenant_id, product_id, category_ids)
+        if parsed_course_ids is not None:
+            _set_product_courses(db, tenant_id, product_id, parsed_course_ids)
+        if parsed_category_ids is not None:
+            _set_product_categories(db, tenant_id, product_id, parsed_category_ids)
 
-        db.commit()
+        if parsed_learning_outcomes is not None:
+            _set_product_learning_outcomes(db, tenant_id, product_id, parsed_learning_outcomes)
+
+        if image is not None and image_bytes is not None:
+            key = _make_storage_key(tenant_id, product_id, image.content_type or "")
+            public_url = _upload_to_supabase(image, image_bytes, key)
+
+            image_url = public_url
+            db.execute(
+                text(
+                    """
+                    update products
+                       set image_url = :url,
+                           updated_at = now()
+                     where tenant_id = :t and id = :p
+                """
+                ),
+                {"url": public_url, "t": tenant_id, "p": product_id},
+            )
 
     except ValueError as ve:
-        db.rollback()
-        return {"ok": False, "message": str(ve)}
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    except IntegrityError as ie:
+        msg = str(getattr(ie, "orig", ie))
+        if "duplicate key value violates unique constraint" in msg and (
+            "products_tenant_id_slug_key" in msg or "products_tenant_slug_uniq" in msg
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "A product with this title/slug already exists for this tenant.",
+                    "tenant_id": tenant_id,
+                    "slug": slug,
+                },
+            )
+        raise HTTPException(
+            status_code=400, detail={"message": "Database integrity error", "error": msg}
+        )
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        db.rollback()
-        return {"ok": False, "message": f"DB error: {type(e).__name__}: {str(e)}"}
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "DB error creating product",
+                "error": f"{type(e).__name__}: {str(e)}",
+            },
+        )
 
     return {
         "ok": True,
         "product": {
             "id": int(row[0]),
             "tenant_id": int(row[1]),
-            "moodle_course_id": int(row[2]) if row[2] is not None else None,
-            "slug": row[3],
-            "title": row[4],
-            "description": row[5],
-            "image_url": row[6],
+            "slug": row[2],
+            "title": row[3],
+            "description": row[4],
+            "long_description_html": row[5],
+            "image_url": image_url if image_url is not None else row[6],
             "price": str(row[7]) if row[7] is not None else None,
             "discounted_price": str(row[8]) if row[8] is not None else None,
             "price_cents": int(row[9]) if row[9] is not None else None,
@@ -1097,116 +615,132 @@ def create_product(
             "identifier": row[12],
             "stock_status": row[13],
             "created_at": str(row[14]),
-            "category_ids": category_ids if category_ids is not None else None,
+            "course_ids": parsed_course_ids if parsed_course_ids is not None else None,
+            "category_ids": parsed_category_ids if parsed_category_ids is not None else None,
+            "learning_outcomes": parsed_learning_outcomes if parsed_learning_outcomes is not None else [],
         },
     }
 
 
 @router.get("/products/paged")
 def list_products_paged(
-    tenant_id: int = Depends(get_tenant_id_from_request),  # ✅ inferred tenant
+    tenant_id: int = Depends(get_tenant_id_from_request),
     page: int = Query(1, ge=1),
     page_size: int = Query(12, ge=1, le=100),
     published_only: bool = True,
+    published: bool | None = Query(None),
     search: str | None = None,
     include_categories: bool = True,
     db: Session = Depends(get_db),
 ):
-    _ensure_products_table(db)
-    if include_categories:
-        _ensure_categories_tables(db)
-
     offset = (page - 1) * page_size
 
     where = ["tenant_id = :t"]
     params = {"t": tenant_id, "limit": page_size, "offset": offset}
 
-    if published_only:
-        where.append("is_published = true")
+    # if published_only:
+    #     where.append("is_published = true")
+
+    # if search and search.strip():
+    #     params["q"] = f"%{search.strip().lower()}%"
+    #     where.append("(lower(slug) like :q or lower(coalesce(title,'')) like :q)")
+
+    if published is not None:
+            where.append("is_published = :published")
+            params["published"] = bool(published)
+    else:
+        if published_only:
+            where.append("is_published = true")
 
     if search and search.strip():
         params["q"] = f"%{search.strip().lower()}%"
         where.append("(lower(slug) like :q or lower(coalesce(title,'')) like :q)")
 
+
     where_sql = " and ".join(where)
 
-    total = db.execute(
-        text(f"select count(*) from products where {where_sql}"),
-        params,
-    ).scalar() or 0
-
     rows = db.execute(
-        text(f"""
-            select id, tenant_id, moodle_course_id, slug, title, description, image_url,
-                   price, discounted_price, price_cents, currency, is_published,
-                   identifier, stock_status, created_at
+        text(
+            f"""
+            select
+                id, tenant_id, slug, title, description, long_description_html, image_url,
+                price, discounted_price, price_cents, currency, is_published,
+                identifier, stock_status, created_at,
+                count(*) over() as total_count
               from products
              where {where_sql}
              order by created_at desc
              limit :limit offset :offset
-        """),
+        """
+        ),
         params,
     ).fetchall()
 
+    total = int(rows[0][15]) if rows else 0
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+
     items = []
     product_ids: list[int] = []
-
     for r in rows:
         pid = int(r[0])
         product_ids.append(pid)
-        items.append({
-            "id": pid,
-            "tenant_id": int(r[1]),
-            "moodle_course_id": int(r[2]) if r[2] is not None else None,
-            "slug": r[3],
-            "title": r[4],
-            "description": r[5],
-            "image_url": r[6],
-            "price": str(r[7]) if r[7] is not None else None,
-            "discounted_price": str(r[8]) if r[8] is not None else None,
-            "price_cents": int(r[9]) if r[9] is not None else None,
-            "currency": r[10],
-            "is_published": bool(r[11]),
-            "identifier": r[12],
-            "stock_status": r[13],
-            "created_at": str(r[14]),
-            "categories": [],
-        })
+        items.append(
+            {
+                "id": pid,
+                "tenant_id": int(r[1]),
+                "slug": r[2],
+                "title": r[3],
+                "description": r[4],
+                "long_description_html": r[5],
+                "image_url": r[6],
+                "price": str(r[7]) if r[7] is not None else None,
+                "discounted_price": str(r[8]) if r[8] is not None else None,
+                "price_cents": int(r[9]) if r[9] is not None else None,
+                "currency": r[10],
+                "is_published": bool(r[11]),
+                "identifier": r[12],
+                "stock_status": r[13],
+                "created_at": str(r[14]),
+                "categories": [],
+            }
+        )
 
     if include_categories and product_ids:
         cat_rows = db.execute(
-            text("""
+            text(
+                """
                 select pc.product_id, c.id, c.name, c.slug
                   from product_categories pc
                   join categories c
                     on c.id = pc.category_id
                    and c.tenant_id = pc.tenant_id
                  where pc.tenant_id = :t
-                   and pc.product_id = any(:pids)
+                   and pc.product_id = any(CAST(:pids AS bigint[]))
                  order by c.name asc
-            """),
+            """
+            ),
             {"t": tenant_id, "pids": product_ids},
         ).fetchall()
 
         cats_by_product: dict[int, list[dict]] = defaultdict(list)
         for pr in cat_rows:
-            cats_by_product[int(pr[0])].append({
-                "id": int(pr[1]),
-                "name": pr[2],
-                "slug": pr[3],
-            })
+            cats_by_product[int(pr[0])].append(
+                {
+                    "id": int(pr[1]),
+                    "name": pr[2],
+                    "slug": pr[3],
+                }
+            )
 
         for item in items:
             item["categories"] = cats_by_product.get(item["id"], [])
 
-    total_pages = (total + page_size - 1) // page_size
-
     return {
         "ok": True,
-        "tenant_id": tenant_id,  # ✅ handy for debugging
+        "tenant_id": tenant_id,
         "page": page,
         "page_size": page_size,
-        "total": int(total),
+        "total": total,
         "total_pages": int(total_pages),
         "items": items,
     }
@@ -1215,36 +749,36 @@ def list_products_paged(
 @router.get("/products/{product_id}")
 def get_product_detail(
     product_id: int,
-    tenant_id: int = Depends(get_tenant_id_from_request),  # ✅ inferred tenant
+    tenant_id: int = Depends(get_tenant_id_from_request),
     include_courses: bool = True,
     include_related: bool = True,
     include_categories: bool = True,
     db: Session = Depends(get_db),
 ):
-    _ensure_products_table(db)
-
     row = db.execute(
-        text("""
-            select id, tenant_id, moodle_course_id, slug, title, description, image_url,
+        text(
+            """
+            select id, tenant_id, slug, title, description, long_description_html, image_url,
                    price, discounted_price, price_cents, currency, is_published,
                    identifier, stock_status, created_at
               from products
              where tenant_id = :t and id = :id
              limit 1
-        """),
+        """
+        ),
         {"t": tenant_id, "id": product_id},
     ).fetchone()
 
     if not row:
-        return {"ok": False, "message": "Product not found", "tenant_id": tenant_id, "product_id": product_id}
+        raise HTTPException(status_code=404, detail="Product not found")
 
-    product = {
+    product: dict[str, object] = {
         "id": int(row[0]),
         "tenant_id": int(row[1]),
-        "moodle_course_id": int(row[2]) if row[2] is not None else None,
-        "slug": row[3],
-        "title": row[4],
-        "description": row[5],
+        "slug": row[2],
+        "title": row[3],
+        "description": row[4],
+        "long_description_html": row[5],
         "image_url": row[6],
         "price": str(row[7]) if row[7] is not None else None,
         "discounted_price": str(row[8]) if row[8] is not None else None,
@@ -1257,29 +791,35 @@ def get_product_detail(
     }
 
     if include_courses:
-        _ensure_product_courses_table(db)
         linked = db.execute(
-            text("""
-                select pc.moodle_course_id, c.fullname, c.summary
+            text(
+                """
+                select c.id, c.moodle_course_id, c.fullname, c.summary
                   from product_courses pc
-                  left join courses c
-                    on c.tenant_id = pc.tenant_id and c.moodle_course_id = pc.moodle_course_id
+                  join courses c
+                    on c.id = pc.course_id
+                   and c.tenant_id = pc.tenant_id
                  where pc.tenant_id = :t and pc.product_id = :p
-                 order by pc.moodle_course_id asc
-            """),
+                 order by c.fullname asc
+            """
+            ),
             {"t": tenant_id, "p": product_id},
         ).fetchall()
 
-        product["courses"] = [{
-            "moodle_course_id": int(r[0]),
-            "fullname": r[1],
-            "summary": r[2],
-        } for r in linked]
+        product["courses"] = [
+            {
+                "course_id": int(r[0]),
+                "moodle_course_id": int(r[1]),
+                "fullname": r[2],
+                "summary": r[3],
+            }
+            for r in linked
+        ]
 
     if include_related:
-        _ensure_related_products_table(db)
         related_rows = db.execute(
-            text("""
+            text(
+                """
                 select p2.id, p2.slug, p2.title, p2.description, p2.image_url,
                        p2.price, p2.discounted_price, p2.currency, p2.is_published, p2.stock_status
                   from product_related pr
@@ -1287,177 +827,316 @@ def get_product_detail(
                     on p2.id = pr.related_product_id and p2.tenant_id = pr.tenant_id
                  where pr.tenant_id = :t and pr.product_id = :p
                  order by pr.created_at desc
-            """),
+            """
+            ),
             {"t": tenant_id, "p": product_id},
         ).fetchall()
 
-        product["related_products"] = [{
-            "id": int(r[0]),
-            "slug": r[1],
-            "title": r[2],
-            "description": r[3],
-            "image_url": r[4],
-            "price": str(r[5]) if r[5] is not None else None,
-            "discounted_price": str(r[6]) if r[6] is not None else None,
-            "currency": r[7],
-            "is_published": bool(r[8]),
-            "stock_status": r[9],
-        } for r in related_rows]
+        product["related_products"] = [
+            {
+                "id": int(r[0]),
+                "slug": r[1],
+                "title": r[2],
+                "description": r[3],
+                "image_url": r[4],
+                "price": str(r[5]) if r[5] is not None else None,
+                "discounted_price": str(r[6]) if r[6] is not None else None,
+                "currency": r[7],
+                "is_published": bool(r[8]),
+                "stock_status": r[9],
+            }
+            for r in related_rows
+        ]
 
     if include_categories:
-        _ensure_categories_tables(db)
         cat_rows = db.execute(
-            text("""
+            text(
+                """
                 select c.id, c.name, c.slug
                   from product_categories pc
                   join categories c
                     on c.id = pc.category_id and c.tenant_id = pc.tenant_id
                  where pc.tenant_id = :t and pc.product_id = :p
                  order by c.name asc
-            """),
+            """
+            ),
             {"t": tenant_id, "p": product_id},
         ).fetchall()
 
-        product["categories"] = [{
-            "id": int(r[0]),
-            "name": r[1],
-            "slug": r[2],
-        } for r in cat_rows]
+        product["categories"] = [
+            {
+                "id": int(r[0]),
+                "name": r[1],
+                "slug": r[2],
+            }
+            for r in cat_rows
+        ]
+
+    product["learning_outcomes"] = _get_product_learning_outcomes(db, tenant_id, product_id)
 
     return {"ok": True, "tenant_id": tenant_id, "product": product}
 
 
-# ✅ CHANGE: remove /tenants/{tenant_id} from the path and infer tenant from request
+@router.post("/products/{product_id}/image")
+def upload_product_image_endpoint(
+    product_id: int,
+    image: UploadFile = File(...),
+    tenant_id: int = Depends(get_tenant_id_from_request),
+    db: Session = Depends(get_db),
+):
+    exists = db.execute(
+        text("select id from products where tenant_id = :t and id = :p limit 1"),
+        {"t": tenant_id, "p": product_id},
+    ).fetchone()
+    if not exists:
+        raise HTTPException(status_code=404, detail="Product not found for this tenant")
+
+    data = image.file.read()
+    _validate_image_bytes(image, data, max_mb=5)
+
+    key = _make_storage_key(tenant_id, product_id, image.content_type or "")
+
+    try:
+        public_url = _upload_to_supabase(image, data, key)
+        db.execute(
+            text(
+                """
+                update products
+                   set image_url = :url,
+                       updated_at = now()
+                 where tenant_id = :t and id = :p
+            """
+            ),
+            {"url": public_url, "t": tenant_id, "p": product_id},
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Failed to upload image",
+                "error": f"{type(e).__name__}: {str(e)}",
+            },
+        )
+
+    return {
+        "ok": True,
+        "tenant_id": tenant_id,
+        "product_id": product_id,
+        "image_url": public_url,
+        "path": key,
+    }
+
+
 @router.patch("/products/{product_id}")
 def update_product(
     product_id: int,
-    payload: UpdateProductPayload,
-    tenant_id: int = Depends(get_tenant_id_from_request),  # ✅ inferred tenant
+    tenant_id: int = Depends(get_tenant_id_from_request),
     db: Session = Depends(get_db),
+    title: str | None = Form(None),
+    description: str | None = Form(None),
+    # ✅ NEW
+    long_description_html: str | None = Form(None),
+    price: str | None = Form(None),
+    discounted_price: str | None = Form(None),
+    currency: str | None = Form(None),
+    identifier: str | None = Form(None),
+    stock_status: str | None = Form(None),
+    is_published: str | None = Form(None),
+    course_ids: str | None = Form(None),
+    category_ids: str | None = Form(None),
+    related_product_ids: str | None = Form(None),
+    learning_outcomes: str | None = Form(None),
+    image: UploadFile | None = File(None),
 ):
-    _ensure_products_table(db)
-
-    prod = db.execute(
-        text("select id from products where id=:p and tenant_id=:t"),
-        {"p": product_id, "t": tenant_id},
+    current = db.execute(
+        text(
+            """
+            select id, tenant_id, slug, title, description, long_description_html, image_url,
+                   price, discounted_price, price_cents, currency, is_published,
+                   identifier, stock_status, created_at
+              from products
+             where tenant_id = :t and id = :p
+             limit 1
+        """
+        ),
+        {"t": tenant_id, "p": product_id},
     ).fetchone()
-    if not prod:
-        return {"ok": False, "message": "Product not found for this tenant", "tenant_id": tenant_id}
 
-    updates = {}
-    sets = []
+    if not current:
+        raise HTTPException(status_code=404, detail="Product not found")
 
-    if payload.slug is not None:
-        updates["slug"] = slugify(payload.slug)
-        sets.append("slug = :slug")
+    current_price_dec = _row_price_to_decimal(current[7], current[9])
 
-    if payload.title is not None:
-        updates["title"] = payload.title
-        sets.append("title = :title")
+    updates: dict[str, object] = {}
 
-    if payload.description is not None:
-        updates["description"] = payload.description
-        sets.append("description = :description")
+    if title is not None:
+        title_clean = (title or "").strip()
+        if not title_clean:
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        updates["title"] = title_clean
+        updates["slug"] = slugify(title_clean)
 
-    if payload.image_url is not None:
-        updates["image_url"] = payload.image_url.strip() if payload.image_url else None
-        sets.append("image_url = :image_url")
+    if description is not None:
+        desc_clean = (description or "").strip()
+        updates["description"] = desc_clean if desc_clean != "" else None
 
-    if payload.price is not None:
-        price = Decimal(str(payload.price))
-        if price <= Decimal("0"):
-            return {"ok": False, "message": "price must be > 0"}
-        updates["price"] = str(price)
-        updates["price_cents"] = to_cents(price)
-        sets.append("price = :price")
-        sets.append("price_cents = :price_cents")
+    # ✅ NEW: HTML update ("" clears)
+    if long_description_html is not None:
+        updates["long_description_html"] = sanitize_html(long_description_html)
 
-    if "discounted_price" in getattr(payload, "model_fields_set", set()):
-        discounted = _parse_optional_price(payload.discounted_price)
-        current_price = None
-        if payload.price is None:
-            current_price = db.execute(
-                text("select price from products where tenant_id=:t and id=:p"),
-                {"t": tenant_id, "p": product_id},
-            ).scalar()
-        base_price = Decimal(str(payload.price)) if payload.price is not None else (
-            Decimal(str(current_price)) if current_price is not None else None
-        )
-        if base_price is not None and discounted is not None and discounted >= base_price:
-            return {"ok": False, "message": "discounted_price must be < price"}
-        updates["discounted_price"] = str(discounted) if discounted is not None else None
-        sets.append("discounted_price = :discounted_price")
+    new_price_dec: Decimal | None = None
+    if price is not None:
+        if str(price).strip() == "":
+            raise HTTPException(status_code=400, detail="price cannot be empty")
+        try:
+            new_price_dec = Decimal(str(price))
+        except Exception:
+            raise HTTPException(status_code=400, detail="price must be a valid number")
+        if new_price_dec <= Decimal("0"):
+            raise HTTPException(status_code=400, detail="price must be > 0")
+        updates["price"] = str(new_price_dec)
+        updates["price_cents"] = to_cents(new_price_dec)
 
-    if payload.currency is not None:
-        updates["currency"] = payload.currency.lower().strip()
-        sets.append("currency = :currency")
+    if discounted_price is not None:
+        if str(discounted_price).strip() == "":
+            updates["discounted_price"] = None
+        else:
+            discounted_dec = _parse_optional_price(discounted_price)
+            if discounted_dec is None:
+                updates["discounted_price"] = None
+            else:
+                price_ref = new_price_dec if new_price_dec is not None else current_price_dec
+                if discounted_dec >= price_ref:
+                    raise HTTPException(
+                        status_code=400, detail="discounted_price must be < price"
+                    )
+                updates["discounted_price"] = str(discounted_dec)
 
-    if payload.is_published is not None:
-        updates["is_published"] = bool(payload.is_published)
-        sets.append("is_published = :is_published")
+    if currency is not None:
+        currency_clean = (currency or "").strip().lower()
+        if not currency_clean:
+            raise HTTPException(status_code=400, detail="currency cannot be empty")
+        updates["currency"] = currency_clean
 
-    if payload.identifier is not None:
-        updates["identifier"] = payload.identifier.strip() if payload.identifier else None
-        sets.append("identifier = :identifier")
+    if identifier is not None:
+        ident_clean = (identifier or "").strip()
+        updates["identifier"] = ident_clean if ident_clean != "" else None
 
-    if payload.stock_status is not None:
-        stock_status = payload.stock_status.strip().lower()
-        if stock_status not in ALLOWED_STOCK_STATUSES:
-            return {"ok": False, "message": f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}"}
-        updates["stock_status"] = stock_status
-        sets.append("stock_status = :stock_status")
+    if stock_status is not None:
+        stock_clean = (stock_status or "").strip().lower()
+        if stock_clean not in ALLOWED_STOCK_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"stock_status must be one of {sorted(ALLOWED_STOCK_STATUSES)}",
+            )
+        updates["stock_status"] = stock_clean
 
-    if payload.moodle_course_id is not None:
-        updates["moodle_course_id"] = payload.moodle_course_id
-        sets.append("moodle_course_id = :moodle_course_id")
+    pub_val = _parse_optional_bool(is_published)
+    if pub_val is not None:
+        updates["is_published"] = pub_val
 
-    category_ids = _normalize_category_ids(payload.category_ids)
+    parsed_course_ids = _parse_ids_json("course_ids", course_ids)
+    parsed_category_ids = _parse_ids_json("category_ids", category_ids)
+    parsed_related_ids = _parse_ids_json("related_product_ids", related_product_ids)
+    parsed_learning_outcomes = _parse_learning_outcomes(learning_outcomes)
 
-    if not sets and category_ids is None:
-        return {"ok": False, "message": "No fields to update"}
-
-    updates["tenant_id"] = tenant_id
-    updates["product_id"] = product_id
+    image_bytes: bytes | None = None
+    if image is not None:
+        image_bytes = image.file.read()
+        _validate_image_bytes(image, image_bytes, max_mb=5)
 
     try:
-        row = None
-        if sets:
+        if updates:
+            set_parts = [f"{col} = :{col}" for col in updates.keys()]
+            set_parts.append("updated_at = now()")
+            set_sql = ", ".join(set_parts)
+
             row = db.execute(
-                text(f"""
+                text(
+                    f"""
                     update products
-                       set {", ".join(sets)}, updated_at = now()
-                     where id = :product_id and tenant_id = :tenant_id
-                    returning id, tenant_id, moodle_course_id, slug, title, description,
-                              image_url, price, discounted_price, price_cents, currency, is_published,
-                              identifier, stock_status, created_at
-                """),
-                updates,
-            ).fetchone()
-
-        if category_ids is not None:
-            _set_product_categories(db, tenant_id, product_id, category_ids)
-
-        if row is None:
-            row = db.execute(
-                text("""
-                    select id, tenant_id, moodle_course_id, slug, title, description,
-                           image_url, price, discounted_price, price_cents, currency, is_published,
-                           identifier, stock_status, created_at
-                      from products
+                       set {set_sql}
                      where tenant_id = :t and id = :p
-                     limit 1
-                """),
-                {"t": tenant_id, "p": product_id},
+                     returning
+                       id, tenant_id, slug, title, description, long_description_html, image_url,
+                       price, discounted_price, price_cents, currency, is_published,
+                       identifier, stock_status, created_at
+                """
+                ),
+                {**updates, "t": tenant_id, "p": product_id},
             ).fetchone()
+        else:
+            row = current
 
-        db.commit()
+        if parsed_course_ids is not None:
+            _set_product_courses(db, tenant_id, product_id, parsed_course_ids)
+
+        if parsed_category_ids is not None:
+            _set_product_categories(db, tenant_id, product_id, parsed_category_ids)
+
+        if parsed_related_ids is not None:
+            _set_related_products(db, tenant_id, product_id, parsed_related_ids)
+
+        if parsed_learning_outcomes is not None:
+            _set_product_learning_outcomes(db, tenant_id, product_id, parsed_learning_outcomes)
+
+        if image is not None and image_bytes is not None:
+            key = _make_storage_key(tenant_id, product_id, image.content_type or "")
+            public_url = _upload_to_supabase(image, image_bytes, key)
+
+            row = db.execute(
+                text(
+                    """
+                    update products
+                       set image_url = :url,
+                           updated_at = now()
+                     where tenant_id = :t and id = :p
+                     returning
+                       id, tenant_id, slug, title, description, long_description_html, image_url,
+                       price, discounted_price, price_cents, currency, is_published,
+                       identifier, stock_status, created_at
+                """
+                ),
+                {"url": public_url, "t": tenant_id, "p": product_id},
+            ).fetchone()
 
     except ValueError as ve:
-        db.rollback()
-        return {"ok": False, "message": str(ve)}
+        raise HTTPException(status_code=400, detail=str(ve))
+
+    except IntegrityError as ie:
+        msg = str(getattr(ie, "orig", ie))
+        if "duplicate key value violates unique constraint" in msg and (
+            "products_tenant_id_slug_key" in msg or "products_tenant_slug_uniq" in msg
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "A product with this title/slug already exists for this tenant.",
+                    "tenant_id": tenant_id,
+                    "slug": updates.get("slug") or current[2],
+                },
+            )
+        raise HTTPException(
+            status_code=400, detail={"message": "Database integrity error", "error": msg}
+        )
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        db.rollback()
-        return {"ok": False, "message": f"DB error: {type(e).__name__}: {str(e)}"}
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "DB error updating product",
+                "error": f"{type(e).__name__}: {str(e)}",
+            },
+        )
+
+    # if PATCH did not include learning_outcomes, return current values
+    if parsed_learning_outcomes is None:
+        learning_outcomes_out = _get_product_learning_outcomes(db, tenant_id, product_id)
+    else:
+        learning_outcomes_out = parsed_learning_outcomes
 
     return {
         "ok": True,
@@ -1465,10 +1144,10 @@ def update_product(
         "product": {
             "id": int(row[0]),
             "tenant_id": int(row[1]),
-            "moodle_course_id": int(row[2]) if row[2] is not None else None,
-            "slug": row[3],
-            "title": row[4],
-            "description": row[5],
+            "slug": row[2],
+            "title": row[3],
+            "description": row[4],
+            "long_description_html": row[5],
             "image_url": row[6],
             "price": str(row[7]) if row[7] is not None else None,
             "discounted_price": str(row[8]) if row[8] is not None else None,
@@ -1478,6 +1157,9 @@ def update_product(
             "identifier": row[12],
             "stock_status": row[13],
             "created_at": str(row[14]),
-            "category_ids": category_ids if category_ids is not None else None,
+            "course_ids": parsed_course_ids if parsed_course_ids is not None else None,
+            "category_ids": parsed_category_ids if parsed_category_ids is not None else None,
+            "related_product_ids": parsed_related_ids if parsed_related_ids is not None else None,
+            "learning_outcomes": learning_outcomes_out,
         },
     }

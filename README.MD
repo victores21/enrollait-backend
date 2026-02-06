@@ -29,4 +29,5 @@ pip freeze > requirements.txt
 python -m venv .venv
 source .venv/bin/activate
 uvicorn app.main:app --reload --port 8000
+{"email":"admin@uam.com","password":"MyStrongPass123"}
 ```
