@@ -383,18 +383,43 @@ def get_tenant_public_info(
     }
 
 
+# @router.get("/tenant-id")
+# def get_tenant_id(request: Request, db: Session = Depends(get_db)):
+#     _ensure_tenants_domain(db)
+
+#     host = (
+#         (request.headers.get("x-forwarded-host") or request.headers.get("host") or "")
+#         .split(":")[0]
+#         .strip()
+#         .lower()
+#     )
+#     if not host:
+#         return {"ok": False, "message": "Missing Host header"}
+
+#     row = db.execute(
+#         text("select id from tenants where lower(domain) = :d limit 1"),
+#         {"d": host},
+#     ).fetchone()
+
+#     if not row:
+#         return {"ok": False, "message": f"No tenant configured for domain: {host}"}
+
+#     return {"ok": True, "tenant_id": int(row[0])}
+
 @router.get("/tenant-id")
 def get_tenant_id(request: Request, db: Session = Depends(get_db)):
     _ensure_tenants_domain(db)
 
     host = (
-        (request.headers.get("x-forwarded-host") or request.headers.get("host") or "")
-        .split(":")[0]
-        .strip()
-        .lower()
+        request.headers.get("x-tenant-host")
+        or request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or ""
     )
+    host = host.split(",")[0].split(":")[0].strip().lower()
+
     if not host:
-        return {"ok": False, "message": "Missing Host header"}
+        return {"ok": False, "message": "Missing tenant host header"}
 
     row = db.execute(
         text("select id from tenants where lower(domain) = :d limit 1"),

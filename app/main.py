@@ -20,7 +20,7 @@ from app.api.routes import kpis
 from app.api.routes import tenant
 
 
-app = FastAPI(title="Enrollait API")
+app = FastAPI(title="Enrollait API", version="1.0.0")
 
 origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
 origins = [o.strip().rstrip("/") for o in origins_env.split(",") if o.strip()]
