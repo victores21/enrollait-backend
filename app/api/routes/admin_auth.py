@@ -27,13 +27,43 @@ class AdminBootstrapPayload(BaseModel):
     name: str | None = None
 
 
+# def _cookie_kwargs(request: Request) -> dict:
+#     secure_env = os.getenv("ADMIN_COOKIE_SECURE", "false").lower() == "true"
+#     # if behind a proxy you can also check x-forwarded-proto
+#     return {
+#         "httponly": True,
+#         "secure": bool(secure_env),
+#         "samesite": os.getenv("ADMIN_COOKIE_SAMESITE", "lax"),
+#         "path": "/",
+#     }
+
 def _cookie_kwargs(request: Request) -> dict:
-    secure_env = os.getenv("ADMIN_COOKIE_SECURE", "false").lower() == "true"
-    # if behind a proxy you can also check x-forwarded-proto
+    """
+    Cookie settings that work for:
+    - local dev (same-site)  -> samesite=lax, secure=false
+    - prod / cross-site      -> samesite=none, secure=true
+    """
+
+    # Normalize samesite to allowed values
+    raw_samesite = (os.getenv("ADMIN_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+    if raw_samesite not in ("lax", "strict", "none"):
+        raw_samesite = "lax"
+
+    # Read secure from env, but also detect HTTPS behind reverse proxy
+    secure_env = os.getenv("ADMIN_COOKIE_SECURE", "false").strip().lower() == "true"
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    is_https_request = forwarded_proto == "https" or request.url.scheme == "https"
+
+    secure = bool(secure_env or is_https_request)
+
+    # 🔒 Browsers REQUIRE Secure when SameSite=None
+    if raw_samesite == "none":
+        secure = True
+
     return {
         "httponly": True,
-        "secure": bool(secure_env),
-        "samesite": os.getenv("ADMIN_COOKIE_SAMESITE", "lax"),
+        "secure": secure,
+        "samesite": raw_samesite,
         "path": "/",
     }
 
@@ -134,8 +164,19 @@ def admin_me(ctx: dict = Depends(require_admin)):
     return {"ok": True, **ctx}
 
 
+# @router.post("/admin/auth/logout")
+# def admin_logout():
+#     jr = JSONResponse({"ok": True})
+#     jr.delete_cookie(os.getenv("ADMIN_COOKIE_NAME", "admin_token"), path="/")
+#     return jr
+
 @router.post("/admin/auth/logout")
-def admin_logout():
+def admin_logout(request: Request):
+    name = os.getenv("ADMIN_COOKIE_NAME", "admin_token")
     jr = JSONResponse({"ok": True})
-    jr.delete_cookie(os.getenv("ADMIN_COOKIE_NAME", "admin_token"), path="/")
+
+    # Delete cookie using same path and security context
+    kwargs = _cookie_kwargs(request)
+    jr.delete_cookie(name, path=kwargs.get("path", "/"))
+
     return jr
